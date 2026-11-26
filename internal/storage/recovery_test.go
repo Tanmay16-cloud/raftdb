@@ -154,6 +154,11 @@ func runCrashTrial(t *testing.T, seed int64) {
 				current[k] = v
 			}
 		}
+		if err == nil && rng.Intn(20) == 0 {
+			if err = tree.Rollback(); err == nil {
+				current = maps.Clone(committed)
+			}
+		}
 		if err == nil && rng.Intn(8) == 0 {
 			if err = tree.Sync(); err == nil {
 				committed = maps.Clone(current)
@@ -212,5 +217,61 @@ func TestBufferPoolEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 	if d := b.dirtyPages(); len(d) != 0 {
 		t.Fatalf("evicted page still listed as dirty: %v", d)
+	}
+}
+
+// After a rollback, the next transaction overwrites the discarded frames in
+// place. If a crash keeps the new commit frame but loses one of the new
+// frames before it, the discarded frame underneath must not be replayed as
+// part of the commit. The chained checksums are what prevent that.
+func TestDiscardedFrameIsNotReplayedAfterRollback(t *testing.T) {
+	fs := newMemFS()
+	f, _ := fs.OpenFile("wal")
+	w, _, err := openWAL(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := func(c byte) []byte { return bytes.Repeat([]byte{c}, PageSize) }
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(w.reset())
+	must(w.append(1, page('a'), &commitInfo{root: 1, numPages: 2}))
+	must(w.sync())
+
+	// A transaction evicts three pages into the log, then rolls back.
+	for id := uint32(10); id < 13; id++ {
+		must(w.append(id, page('s'), nil))
+	}
+	w.rollback()
+
+	// The next transaction writes three frames over the same slots, the last
+	// one a commit. Power fails before the fsync; the middle write is lost.
+	must(w.append(20, page('n'), nil))
+	must(w.append(21, page('n'), nil))
+	must(w.append(22, page('n'), &commitInfo{root: 22, numPages: 23}))
+	mf := f.(*memFile)
+	data := bytes.Clone(mf.durable)
+	for i, wr := range mf.pending {
+		if i != 4 { // writes: 3 discarded frames, then 20, 21 (lost), 22
+			data = wr.apply(data)
+		}
+	}
+
+	after := newMemFS()
+	after.files["wal"] = &memFile{fs: after, data: data, durable: bytes.Clone(data)}
+	f2, _ := after.OpenFile("wal")
+	w2, last, err := openWAL(f2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last == nil || last.root != 1 {
+		t.Fatalf("recovered commit %+v, want the first commit (root 1)", last)
+	}
+	if _, ok := w2.index[11]; ok || len(w2.index) != 1 {
+		t.Fatalf("recovery replayed frames it should have ignored: index = %v", w2.index)
 	}
 }

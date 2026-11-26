@@ -154,6 +154,11 @@ type Delete struct {
 	Where Expr
 }
 
+// Explain is EXPLAIN SELECT ...: show the query plan instead of running it.
+type Explain struct {
+	Query *Select
+}
+
 // Begin, Commit and Rollback control transactions.
 type (
 	Begin    struct{}
@@ -169,6 +174,7 @@ func (*Insert) statement()      {}
 func (*Select) statement()      {}
 func (*Update) statement()      {}
 func (*Delete) statement()      {}
+func (*Explain) statement()     {}
 func (*Begin) statement()       {}
 func (*Commit) statement()      {}
 func (*Rollback) statement()    {}
@@ -331,9 +337,10 @@ func (s *Delete) String() string {
 	return "DELETE FROM " + quoteIdent(s.Table)
 }
 
-func (*Begin) String() string    { return "BEGIN" }
-func (*Commit) String() string   { return "COMMIT" }
-func (*Rollback) String() string { return "ROLLBACK" }
+func (s *Explain) String() string { return "EXPLAIN " + s.Query.String() }
+func (*Begin) String() string     { return "BEGIN" }
+func (*Commit) String() string    { return "COMMIT" }
+func (*Rollback) String() string  { return "ROLLBACK" }
 
 // ---------------------------------------------------------------------------
 // Expressions

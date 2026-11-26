@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -256,6 +258,7 @@ func runRandomOps(t *testing.T, opts Options) {
 	tree, path := openTempOpts(t, opts)
 	rng := rand.New(rand.NewSource(3))
 	model := map[string]string{}
+	committed := map[string]string{}
 	for op := 1; op <= 30000; op++ {
 		k := fmt.Sprintf("key%d", rng.Intn(3000))
 		switch r := rng.Intn(10); {
@@ -277,8 +280,18 @@ func runRandomOps(t *testing.T, opts Options) {
 			checkGet(t, tree, k, want, wantFound)
 		}
 		if op%500 == 0 {
-			if err := tree.Sync(); err != nil {
-				t.Fatal(err)
+			if rng.Intn(3) == 0 {
+				// Throw away everything since the last commit.
+				if err := tree.Rollback(); err != nil {
+					t.Fatal(err)
+				}
+				model = maps.Clone(committed)
+				checkMatches(t, tree, model)
+			} else {
+				if err := tree.Sync(); err != nil {
+					t.Fatal(err)
+				}
+				committed = maps.Clone(model)
 			}
 		}
 		if op%5000 == 0 {
@@ -376,4 +389,36 @@ func BenchmarkGet(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// A dirty page evicted to the log and then read back sits in the buffer
+// pool as a clean page, but its contents are still uncommitted. Rollback
+// must drop it too, or the discarded changes stay visible.
+func TestRollbackDropsPagesReadBackFromTheLog(t *testing.T) {
+	tree, _ := openTempOpts(t, Options{PoolPages: 4, CheckpointFrames: 1000})
+	committed := map[string]string{}
+	for i := 0; i < 200; i++ {
+		k, v := fmt.Sprintf("key%04d", i), strings.Repeat("c", 100)
+		if err := tree.Put([]byte(k), []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+		committed[k] = v
+	}
+	if err := tree.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	// Overwrite everything, forcing many evictions of uncommitted pages,
+	// then read every page back without changing it again.
+	for k := range committed {
+		if err := tree.Put([]byte(k), []byte("uncommitted")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for k := range committed {
+		checkGet(t, tree, k, "uncommitted", true)
+	}
+	if err := tree.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	checkMatches(t, tree, committed)
 }

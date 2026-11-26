@@ -49,6 +49,7 @@ type Stats struct {
 	CacheMisses int64
 	Evictions   int64
 	Commits     int64
+	Rollbacks   int64
 	Checkpoints int64
 }
 
@@ -88,6 +89,9 @@ type Pager struct {
 	metaDirty bool
 	err       error // set by fail; once set, every operation returns it
 	stats     Stats
+
+	// The root and page count as of the last commit, restored by Rollback.
+	committedRoot, committedPages uint32
 }
 
 // OpenPager opens the database at path, creating it if it does not exist,
@@ -109,6 +113,7 @@ func OpenPager(path string, opts Options) (*Pager, error) {
 		walFile.Close()
 		return nil, err
 	}
+	p.committedRoot, p.committedPages = p.root, p.numPages
 	return p, nil
 }
 
@@ -203,7 +208,7 @@ func (p *Pager) Read(id uint32) ([]byte, error) {
 	p.stats.CacheMisses++
 
 	buf := make([]byte, PageSize)
-	if off, ok := p.wal.index[id]; ok {
+	if off, ok := p.wal.lookup(id); ok {
 		// The newest version is in the log: either committed but not yet
 		// checkpointed, or evicted from the pool before being committed.
 		if err := p.wal.readPage(off, buf); err != nil {
@@ -296,6 +301,7 @@ func (p *Pager) Commit() error {
 	}
 	p.pool.markClean()
 	p.metaDirty = false
+	p.committedRoot, p.committedPages = p.root, p.numPages
 	p.stats.Commits++
 
 	if p.wal.frames() >= p.opts.CheckpointFrames {
@@ -303,6 +309,27 @@ func (p *Pager) Commit() error {
 			return p.fail(err)
 		}
 	}
+	return nil
+}
+
+// Rollback discards every change since the last Commit. Dirty pages are
+// dropped from the buffer pool, frames that evictions wrote to the log are
+// forgotten, and pages allocated since the commit are given back.
+//
+// A page that was evicted to the log and then read back is in the pool as a
+// clean page, but its contents are uncommitted, so it is dropped as well.
+func (p *Pager) Rollback() error {
+	if p.err != nil {
+		return p.err
+	}
+	p.pool.discardDirty()
+	for id := range p.wal.pending {
+		p.pool.drop(id)
+	}
+	p.wal.rollback()
+	p.root, p.numPages = p.committedRoot, p.committedPages
+	p.metaDirty = false
+	p.stats.Rollbacks++
 	return nil
 }
 

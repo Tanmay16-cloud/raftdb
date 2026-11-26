@@ -4,8 +4,9 @@ A distributed SQL database built from scratch in Go: a SQL front end, a
 B+ tree storage engine with a write-ahead log, MVCC transactions, and Raft
 replication across nodes.
 
-> Status: **Milestone 3 of 7 complete.** The storage engine is crash-safe and
-> runs in bounded memory, and the SQL parser is fuzz-tested.
+> Status: **Milestone 4 of 7 complete.** raftdb runs SQL on a single node:
+> tables, secondary indexes, joins, aggregates and transactions, planned by a
+> rule-based optimizer and executed on a crash-safe storage engine.
 
 ## Architecture (target)
 
@@ -35,8 +36,11 @@ replication across nodes.
 - [x] **3. SQL front end.** Hand-written lexer and recursive-descent parser
       with precedence climbing, producing an AST that prints back as
       canonical SQL. Fuzz-tested for crashes and round-trip stability.
-- [ ] **4. Executor.** Row encoding onto the key/value store, secondary
-      indexes, a planner that chooses between scans and index lookups.
+- [x] **4. Executor.** Rows and indexes encoded onto the key/value store,
+      a planner that chooses between scans, key lookups, index range scans,
+      hash joins and nested-loop joins, `EXPLAIN`, and atomic statements and
+      transactions. Verified by differential testing of index plans against
+      full scans.
 - [ ] **5. Transactions.** MVCC with snapshot isolation.
 - [ ] **6. Replication.** Raft over gRPC, tested with injected partitions and
       crashes.
@@ -48,23 +52,206 @@ replication across nodes.
 ```sh
 go test ./...                                    # run the test suite
 go test ./internal/storage -run=XXX -bench=.     # run the benchmarks
-go run ./cmd/raftdb -db demo.db                  # interactive shell
+go run ./cmd/raftdb -db demo.db                  # SQL shell
 go test ./internal/parser -fuzz=FuzzParse -fuzztime=60s   # fuzz the parser
 ```
 
+The shell reads statements ending in `;`, which may span lines, and has a
+few backslash commands: `\d` lists tables, `\d <table>` shows a schema,
+`\parse <sql>` shows the parser's reading of a statement, `\timing`,
+`\stats`, `\q`.
+
 ```
-> put user:1 Asha
-> put user:2 Rohan
-> scan user: user;
-user:1 = Asha
-user:2 = Rohan
-(2 keys)
-> parse SELECT name FROM users WHERE age > 18 AND city = 'Pilani' OR NOT active
-*parser.Select
-  SELECT name FROM users WHERE (((age > 18) AND (city = 'Pilani')) OR (NOT active))
-> parse SELECT * FROM users WHERE
-error: line 1, column 26: expected expression, got end of input
+raftdb=> CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT, city TEXT);
+raftdb=> CREATE INDEX users_age ON users (age);
+raftdb=> INSERT INTO users VALUES (1, 'Asha', 22, 'Pilani'), (2, 'Rohan', 17, 'Goa'),
+raftdb->                          (3, 'Meera', 30, 'Pilani'), (4, 'Kabir', NULL, 'Delhi');
+INSERT 4
+raftdb=> CREATE TABLE orders (oid INT PRIMARY KEY, uid INT, amount FLOAT);
+raftdb=> INSERT INTO orders VALUES (10, 1, 99.5), (11, 1, 10), (12, 3, 5.25);
+raftdb=> SELECT name, age FROM users WHERE age BETWEEN 18 AND 30 ORDER BY age;
+name  | age
+------+----
+Asha  |  22
+Meera |  30
+(2 rows)
+raftdb=> EXPLAIN SELECT name, age FROM users WHERE age BETWEEN 18 AND 30 ORDER BY age;
+                              QUERY PLAN
+----------------------------------------------------------------------
+Sort: age
+-> Project: name, age
+   -> Filter: (age BETWEEN 18 AND 30)
+      -> Index Scan using users_age on users ((age BETWEEN 18 AND 30))
+raftdb=> SELECT u.name, count(*) AS orders, sum(o.amount) AS total
+raftdb-> FROM users u JOIN orders o ON u.id = o.uid
+raftdb-> GROUP BY u.name ORDER BY total DESC;
+name  | orders | total
+------+--------+------
+Asha  |      2 | 109.5
+Meera |      1 |  5.25
+(2 rows)
+raftdb=> EXPLAIN SELECT u.name, sum(o.amount) AS total FROM users u JOIN orders o ON u.id = o.uid GROUP BY u.name;
+            QUERY PLAN
+----------------------------------
+Project: name, total
+-> Hash Aggregate: group by u.name
+   -> Hash Join: (u.id = o.uid)
+      -> Seq Scan on users u
+      -> Seq Scan on orders o
+raftdb=> INSERT INTO users VALUES (2, 'Dev', 40, 'Goa');
+ERROR: duplicate key value violates primary key: id = 2 already exists
 ```
+
+## Executor (Milestone 4)
+
+`internal/engine` runs SQL on top of the storage engine. It has four parts:
+a catalog, an encoding of rows and indexes as keys and values, a planner,
+and an executor.
+
+### Everything is a key
+
+The whole database lives in the B+ tree's single ordered key space:
+
+| Key | Value |
+|---|---|
+| `c/<table name>` | table definition (JSON) |
+| `s/next-id` | the next table or index ID |
+| `r` + table ID + primary key | the row |
+| `x` + index ID + indexed value + primary key | the primary key |
+| `q` + table ID | the next hidden row ID (tables without a primary key) |
+
+IDs are 4-byte big-endian, so a table's rows, and an index's entries, sit
+next to each other and a prefix scan reads exactly them.
+
+Primary keys and indexed values use an **order-preserving encoding**:
+comparing two encodings byte by byte gives the same answer as comparing the
+values. That is what lets a B+ tree range scan answer `WHERE age BETWEEN 18
+AND 30`.
+- Integers are 8 bytes big-endian with the sign bit flipped, so negative
+  numbers sort first.
+- Floats are their IEEE 754 bits, with all bits flipped for negative numbers
+  and only the sign bit for positive ones. `-0.0` is normalised to `0.0`.
+- Text has each `0x00` escaped as `0x00 0xFF` and ends with `0x00 0x01`.
+  The terminator sorts below every escaped byte, so `"ab"` < `"abc"`. No
+  encoding is a prefix of another, which matters because index keys have the
+  primary key appended: without it, `("a", pk "b…")` could sort after
+  `("ab", …)`.
+- `NULL`, `FALSE` and `TRUE` are single tag bytes.
+
+Appending the primary key to each index key keeps duplicate values distinct,
+and the entry's value is the primary key, so an index scan fetches each row
+with one more lookup. Rows themselves use a compact format (varints and
+length-prefixed strings) that need not preserve order.
+
+### Planning
+
+A `SELECT` becomes a tree of operators, built bottom-up:
+
+```
+Limit → Sort → Distinct → Project → Filter (HAVING) → Hash Aggregate
+      → joins → scans with their own filters
+```
+
+**Predicate pushdown.** The `WHERE` clause, and every `ON` clause (all joins
+are inner joins), is split into its `AND`-ed conjuncts. Each one goes as low
+in the tree as it can. A condition on one table filters that table's scan,
+and may choose how the table is read. A condition linking tables runs at the
+first join where all of them are present.
+
+**Access paths.** For each table the planner picks, by rule (there are no
+statistics yet), the first of:
+
+1. primary key = constant (**Primary Key Lookup**: one row)
+2. unique indexed column = constant
+3. indexed column = constant (**Index Scan**)
+4. a range on the primary key (**Primary Key Range Scan**)
+5. a range on an indexed column
+6. a full scan (**Seq Scan**)
+
+It recognises `col op constant`, `constant op col` and `BETWEEN`, and
+combines several conditions on one column into the tightest range. A
+condition that can't be turned into a range is left to the filter, such as
+`age + 1 = 23`, an `OR`, or `age = 22.5` on an `INT` column. The filter
+also re-checks every condition the range already guarantees, so the
+access-path code is free to be approximate but never wrong.
+
+**Joins.** Tables are joined left-deep, in the order written. If a join
+condition has the form `left_expr = right_expr`, it uses a **hash join**: it
+builds a hash table on the new table's key and probes it with each row so
+far. Otherwise it uses a **nested-loop join**. `EXPLAIN` prints the chosen
+tree, in the style of PostgreSQL.
+
+### Execution
+
+Operators follow the **iterator (Volcano) model**: each one pulls rows from
+its inputs one at a time. Scans, filters, projections and limits stream.
+Sort, aggregation, `DISTINCT` and a hash join's build side must see all
+their input first.
+
+Semantics follow PostgreSQL where it matters:
+- **NULL and three-valued logic.** `NULL = NULL` is `NULL`, `WHERE` keeps
+  only `TRUE`, and `false AND NULL` is `false`.
+- **Ordering.** `NULL`s sort last.
+- **Unique indexes.** Any number of `NULL`s may share a unique index.
+- **Types.** `INT` widens to `FLOAT` and nothing else converts implicitly.
+- **Arithmetic.** Integer overflow and division by zero are errors.
+- **Grouping.** Column references are checked against `GROUP BY`.
+
+**Atomic statements and transactions.** Outside `BEGIN`, each statement
+commits on its own. If it fails, the storage engine rolls back everything
+since the last commit, so a multi-row `INSERT` that hits a duplicate on its
+third row leaves nothing behind, index entries included. Inside
+`BEGIN … COMMIT`, an error rolls back the whole transaction, because the
+storage engine can only roll back to the last commit.
+
+**UPDATE and DELETE** collect the matching rows before changing any, which
+avoids the "Halloween problem": an update that moves a row forward in the
+index being scanned would otherwise meet that row again. An `UPDATE` then
+deletes every old row before writing any new one. So primary key and unique
+checks see the statement's final state, and `UPDATE t SET id = id + 1`
+succeeds whatever order the rows were read in. PostgreSQL, checking row by
+row, can fail on that statement.
+
+### Testing the executor
+
+- **Encoding properties.** For 200k random pairs of values (extreme
+  integers, signed zeros, infinities, strings with NUL bytes), encoded order
+  must equal value order, and no encoding may be a prefix of another. Rows
+  must round-trip exactly, and every truncation of a row must be rejected.
+- **SQL tests.** About 45 queries checked for exact results. `EXPLAIN`
+  checks that the planner picks the right access path and join. About 40
+  error messages are pinned down, and the tests check that none of the
+  failing statements changed anything.
+- **Atomicity, transactions and persistence.** Partial inserts and updates
+  leave no trace. Rollback undoes schema changes, and `DROP TABLE` really
+  removes the rows from storage. After a reopen, the catalog and indexes are
+  still there, IDs are not reused, and an uncommitted transaction is gone.
+- **Differential testing** (`random_test.go`). Two databases receive the same
+  random inserts, updates, deletes and transactions; only one has secondary
+  indexes. Every random query must return the same rows from both, so every
+  index plan is checked against a full scan. After every few hundred steps,
+  each index must hold exactly one correct entry per row. An 8-page buffer
+  pool keeps the storage engine evicting throughout.
+
+The differential test found two real bugs:
+- **Rollback kept uncommitted data.** A dirty page evicted to the log and then
+  read back sat in the buffer pool marked clean, so `Rollback`, which dropped
+  only dirty pages, kept it.
+- **`SET id = id + 1` could fail.** It succeeded or failed depending on
+  whether the plan read rows in key order or index order.
+
+Both now have targeted regression tests.
+
+Statement coverage: about 86%.
+
+### Known limitations
+- The planner is rule-based. It has no statistics, does no cost estimates
+  and doesn't reorder joins.
+- Only inner joins; no outer joins or subqueries.
+- Sorting, aggregation, hash joins and `UPDATE`/`DELETE` hold their input
+  in memory.
+- An index covers one column.
+- Errors inside a transaction abort it, since there are no savepoints.
 
 ## SQL parser (Milestone 3)
 
@@ -181,6 +368,18 @@ undo anything: it copies committed frames into the data file and discards the
 rest. Interrupting recovery is harmless, because running it again copies the
 same pages.
 
+**Rollback** discards everything since the last commit. It drops the pool's
+dirty pages, plus any page read back from an uncommitted log frame, then
+rewinds the end of the log to the last commit record and restores the root
+and page count. The next transaction overwrites the discarded frames in
+place, which creates a subtle hazard. Say a crash keeps a new commit frame
+but loses a new frame before it. A discarded frame would then still sit in
+between, with the right salt and a valid checksum of its own. To rule this
+out, **checksums are chained**: each frame's CRC also covers the previous
+frame's CRC. The discarded frame was computed from a different predecessor,
+so recovery rejects it. `TestDiscardedFrameIsNotReplayedAfterRollback`
+reproduces exactly this crash.
+
 **Full page images** also protect against torn writes in the data file: if a
 crash leaves a page half-written during a checkpoint, the log still has the
 complete page and recovery rewrites it.
@@ -209,9 +408,9 @@ own memory and replaces page buffers instead of modifying them.
 - Creating a database doesn't fsync the parent directory, which a fully
   durable implementation on Linux would need.
 
-## Testing
+## Storage testing
 
-- **Model-based tests:** random puts, deletes, commits and reopens checked
+- **Model-based tests:** random puts, deletes, commits, rollbacks and reopens checked
   against a Go map. One configuration keeps only 4 pages in the buffer pool and
   checkpoints every 20 frames, so evictions and checkpoints happen constantly.
 - **Crash simulation** (`memfs_test.go`): an in-memory file system tracks

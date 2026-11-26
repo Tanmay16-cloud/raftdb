@@ -92,3 +92,23 @@ func (b *bufferPool) markClean() {
 	}
 	clear(b.dirty)
 }
+
+// discardDirty drops every page changed since the last commit, so the next
+// read fetches the committed version from the log or the data file.
+func (b *bufferPool) discardDirty() {
+	for id := range b.dirty {
+		b.lru.Remove(b.pages[id])
+		delete(b.pages, id)
+	}
+	clear(b.dirty)
+}
+
+// drop removes page id from the pool, if it is there, without writing it
+// anywhere.
+func (b *bufferPool) drop(id uint32) {
+	if e, ok := b.pages[id]; ok {
+		b.lru.Remove(e)
+		delete(b.pages, id)
+		delete(b.dirty, id)
+	}
+}

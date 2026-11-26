@@ -74,7 +74,8 @@ var canonicalCases = []struct{ in, want string }{
 	{"DELETE FROM users WHERE NOT active", "DELETE FROM users WHERE (NOT active)"},
 	{"DELETE FROM users", "DELETE FROM users"},
 
-	// Transactions
+	// Transactions and EXPLAIN
+	{"explain select a from t where a > 1", "EXPLAIN SELECT a FROM t WHERE (a > 1)"},
 	{"begin transaction", "BEGIN"},
 	{"COMMIT;", "COMMIT"},
 	{"rollback", "ROLLBACK"},
@@ -152,6 +153,7 @@ func TestErrors(t *testing.T) {
 		{"SELECT a BETWEEN 1 OR 2", "line 1, column 20: expected AND, got keyword OR"},
 		{"UPDATE t SET a == 1", "line 1, column 17: expected expression, got \"=\""},
 		{"SELECT 1; SELECT 2", "expected one statement, found 2"},
+		{"EXPLAIN DELETE FROM t", "line 1, column 9: expected SELECT, got keyword DELETE"},
 		{"", "expected one statement, found 0"},
 	}
 	for _, c := range cases {

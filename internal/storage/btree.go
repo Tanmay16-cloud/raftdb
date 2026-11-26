@@ -287,6 +287,16 @@ func (t *BTree) Sync() error {
 	return t.pager.Commit()
 }
 
+// Rollback discards every change made since the previous Sync.
+func (t *BTree) Rollback() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return ErrClosed
+	}
+	return t.pager.Rollback()
+}
+
 // Stats returns storage activity counters since the tree was opened.
 func (t *BTree) Stats() Stats {
 	t.mu.Lock()
