@@ -1,5 +1,7 @@
 # raftdb
 
+[![CI](https://github.com/Tanmay16-cloud/raftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tanmay16-cloud/raftdb/actions/workflows/ci.yml)
+
 A distributed SQL database built from scratch in Go: a SQL front end, a
 B+ tree storage engine with a write-ahead log, MVCC transactions, and Raft
 replication across nodes.
