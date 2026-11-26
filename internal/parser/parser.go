@@ -19,7 +19,7 @@ var reserved = setOf(
 // them, which keeps canonical output unambiguous.
 var contextual = setOf(
 	"PRIMARY", "KEY", "INDEX", "UNIQUE", "IF", "EXISTS", "ASC", "DESC",
-	"BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "EXPLAIN",
+	"BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "EXPLAIN", "VACUUM",
 )
 
 var keywords = union(reserved, contextual)
@@ -223,6 +223,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return &Commit{}, nil
 	case p.acceptWord("ROLLBACK"):
 		return &Rollback{}, nil
+	case p.acceptWord("VACUUM"):
+		return &Vacuum{}, nil
 	case p.acceptWord("EXPLAIN"):
 		if !p.isWord("SELECT") {
 			return nil, p.unexpected("SELECT")

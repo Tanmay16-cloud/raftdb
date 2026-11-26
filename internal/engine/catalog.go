@@ -1,13 +1,15 @@
 package engine
 
 import (
-	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"strings"
 
+	"raftdb/internal/mvcc"
 	"raftdb/internal/parser"
-	"raftdb/internal/storage"
 )
 
 // Table is a table definition, stored as JSON under c/<name>.
@@ -58,13 +60,12 @@ func (t *Table) String() string {
 	return strings.Join(lines, "\n")
 }
 
-// loadCatalog reads every table definition into memory. It runs at open and
-// after a rollback, which may have undone schema changes.
-func (db *DB) loadCatalog() error {
-	db.tables = make(map[string]*Table)
-	it := db.scan(catalogKey(""), prefixEnd(catalogKey("")))
+// loadCatalog reads every table definition visible to the transaction.
+func (tx *txn) loadCatalog() error {
+	tx.tables = make(map[string]*Table)
+	it := tx.scan(catalogKey(""), prefixEnd(catalogKey("")))
 	for {
-		_, v, ok, err := it.next()
+		_, v, ok, err := it.Next()
 		if err != nil {
 			return err
 		}
@@ -75,46 +76,38 @@ func (db *DB) loadCatalog() error {
 		if err := json.Unmarshal(v, t); err != nil {
 			return fmt.Errorf("engine: corrupt catalog entry: %w", err)
 		}
-		db.tables[t.Name] = t
+		tx.tables[t.Name] = t
 	}
 }
 
-func (db *DB) saveTable(t *Table) error {
+func (tx *txn) saveTable(t *Table) error {
 	b, err := json.Marshal(t)
 	if err != nil {
 		return err
 	}
-	if len(b) > storage.MaxValueSize {
-		return fmt.Errorf("the definition of table %q is too large (%d bytes; the limit is %d)", t.Name, len(b), storage.MaxValueSize)
+	if len(b) > mvcc.MaxValueSize {
+		return fmt.Errorf("the definition of table %q is too large (%d bytes; the limit is %d)", t.Name, len(b), mvcc.MaxValueSize)
 	}
-	if err := db.tree.Put(catalogKey(t.Name), b); err != nil {
+	if err := tx.kv.Put(catalogKey(t.Name), b); err != nil {
 		return err
 	}
-	db.tables[t.Name] = t
+	tx.ownCatalog()
+	tx.tables[t.Name] = t
 	return nil
 }
 
-// nextID allocates an ID for a new table or index.
-func (db *DB) nextID() (uint32, error) {
-	return db.counter(nextIDKey)
+// nextID allocates an ID for a new table or index. IDs come from a
+// sequence, so they are never reused, even by rolled-back transactions.
+func (tx *txn) nextID() (uint32, error) {
+	n, err := tx.db.store.Sequence(nextIDKey)
+	if n > math.MaxUint32 {
+		return 0, errors.New("engine: out of table and index IDs")
+	}
+	return uint32(n), err
 }
 
-// counter increments the counter stored under key and returns its old value.
-// Counters start at 1.
-func (db *DB) counter(key []byte) (uint32, error) {
-	id := uint32(1)
-	v, ok, err := db.tree.Get(key)
-	if err != nil {
-		return 0, err
-	}
-	if ok {
-		id = binary.BigEndian.Uint32(v)
-	}
-	return id, db.tree.Put(key, binary.BigEndian.AppendUint32(nil, id+1))
-}
-
-func (db *DB) table(name string) (*Table, error) {
-	t, ok := db.tables[name]
+func (tx *txn) table(name string) (*Table, error) {
+	t, ok := tx.tables[name]
 	if !ok {
 		return nil, fmt.Errorf("table %q does not exist", name)
 	}
@@ -122,8 +115,8 @@ func (db *DB) table(name string) (*Table, error) {
 }
 
 // findIndex returns the index called name and the table it belongs to.
-func (db *DB) findIndex(name string) (*Table, int) {
-	for _, t := range db.tables {
+func (tx *txn) findIndex(name string) (*Table, int) {
+	for _, t := range tx.tables {
 		for i, idx := range t.Indexes {
 			if idx.Name == name {
 				return t, i
@@ -133,15 +126,12 @@ func (db *DB) findIndex(name string) (*Table, int) {
 	return nil, -1
 }
 
-// Tables returns the definitions of every table.
-func (db *DB) Tables() []*Table {
-	out := make([]*Table, 0, len(db.tables))
-	for _, t := range db.tables {
-		out = append(out, t)
+// ownCatalog marks the transaction as changing the schema and gives it a
+// private copy of the catalog map, which may be shared with the database's
+// cache and other transactions until then.
+func (tx *txn) ownCatalog() {
+	if !tx.ddl {
+		tx.tables = maps.Clone(tx.tables)
+		tx.ddl = true
 	}
-	slicesSortByName(out)
-	return out
 }
-
-// Table returns the definition of one table, or nil.
-func (db *DB) Table(name string) *Table { return db.tables[name] }

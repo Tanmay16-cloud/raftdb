@@ -16,6 +16,8 @@ import (
 )
 
 const help = `Enter SQL statements ending with ';' (they may span several lines).
+BEGIN; ... COMMIT; groups statements into a transaction, and VACUUM; removes
+old row versions that no transaction can see any more.
   \d             list tables
   \d <table>     show a table's schema and indexes
   \parse <sql>   show how the parser reads a statement, without running it

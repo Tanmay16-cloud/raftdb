@@ -143,6 +143,16 @@ func runDifferential(t *testing.T, seed int64) {
 		default:
 			both("SELECT * FROM t WHERE " + where())
 		}
+		if step%50 == 49 {
+			// Garbage-collect old versions. Without it the tree fills with
+			// dead versions (each UPDATE rewrites every row it matches);
+			// with it, vacuum itself must never change what a query returns.
+			for _, db := range []*DB{plain, indexed} {
+				if _, err := db.Query("VACUUM"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
 		if step%250 == 0 {
 			checkIndexes(t, indexed)
 		}

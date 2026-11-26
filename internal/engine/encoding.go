@@ -6,14 +6,17 @@ import (
 	"math"
 )
 
-// The SQL layer stores everything in the storage engine's single ordered
-// key space:
+// The SQL layer stores everything as keys in the MVCC store (each key
+// versioned there):
 //
-//	c/<table name>                       -> table definition (JSON)
-//	s/next-id                            -> next table or index ID
-//	q<table ID>                          -> next hidden row ID, for tables without a primary key
-//	r<table ID><primary key>             -> row
-//	x<index ID><indexed value><primary key> -> primary key
+//	c/<table name>                           -> table definition (JSON)
+//	r<table ID><primary key>                 -> row
+//	x<index ID><indexed value><primary key>  -> primary key
+//	x<index ID><indexed value>               -> primary key (unique index, non-NULL value)
+//
+// and two kinds of non-transactional sequence (see mvcc.Store.Sequence):
+// next-id for table and index IDs, and q<table ID> for the hidden row IDs
+// of tables without a primary key.
 //
 // IDs are 4-byte big-endian integers, so all rows of a table, and all
 // entries of an index, sit next to each other in key order.
@@ -21,8 +24,11 @@ import (
 // Primary keys and indexed values use an order-preserving encoding:
 // comparing two encoded values byte by byte gives the same answer as
 // comparing the values themselves. That is what lets a B+ tree range scan
-// answer "WHERE age BETWEEN 18 AND 30". Including the primary key in each
-// index key keeps the keys of duplicate values distinct.
+// answer "WHERE age BETWEEN 18 AND 30". In a non-unique index, appending
+// the primary key keeps the keys of duplicate values distinct. A unique
+// index leaves it off, so that two transactions inserting the same value
+// write the same key and MVCC detects the conflict. NULLs, which a unique
+// index may hold any number of, keep the primary key.
 
 const (
 	tagNull  byte = 0x01
@@ -100,7 +106,7 @@ func withID(tag byte, id uint32) []byte {
 
 func catalogKey(name string) []byte { return append([]byte("c/"), name...) }
 
-var nextIDKey = []byte("s/next-id")
+var nextIDKey = []byte("next-id")
 
 func rowIDKey(tableID uint32) []byte    { return withID('q', tableID) }
 func rowPrefix(tableID uint32) []byte   { return withID('r', tableID) }
@@ -108,8 +114,12 @@ func indexPrefix(indexID uint32) []byte { return withID('x', indexID) }
 
 func rowKey(tableID uint32, pk []byte) []byte { return append(rowPrefix(tableID), pk...) }
 
-func indexKey(indexID uint32, v Value, pk []byte) []byte {
-	return append(appendKey(indexPrefix(indexID), v), pk...)
+func indexKey(idx *Index, v Value, pk []byte) []byte {
+	key := appendKey(indexPrefix(idx.ID), v)
+	if idx.Unique && v != nil {
+		return key
+	}
+	return append(key, pk...)
 }
 
 // Rows are stored in a compact format that need not preserve order: for

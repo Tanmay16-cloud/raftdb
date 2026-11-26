@@ -12,7 +12,7 @@ import (
 // one row at a time; sort, hash join (its build side), aggregation and the
 // inner side of a nested-loop join must see all their input first.
 type planNode interface {
-	open(db *DB) (iterator, error)
+	open(tx *txn) (iterator, error)
 	explain() string
 	inputs() []planNode
 }
@@ -64,7 +64,7 @@ func drain(it iterator) ([]Row, error) {
 // valuesNode produces one empty row, for SELECT without FROM.
 type valuesNode struct{}
 
-func (valuesNode) open(*DB) (iterator, error) {
+func (valuesNode) open(*txn) (iterator, error) {
 	done := false
 	return iterFunc(func() (Row, error) {
 		if done {
@@ -115,7 +115,7 @@ func (n *scanNode) explain() string {
 
 func (n *scanNode) inputs() []planNode { return nil }
 
-func (n *scanNode) open(db *DB) (iterator, error) {
+func (n *scanNode) open(tx *txn) (iterator, error) {
 	t := n.table
 	rp := rowPrefix(t.ID)
 	prefix := rp
@@ -127,10 +127,10 @@ func (n *scanNode) open(db *DB) (iterator, error) {
 	if n.path.hi != nil {
 		end = append(slices.Clip(prefix), n.path.hi...)
 	}
-	it := db.scan(start, end)
+	it := tx.scan(start, end)
 
 	return iterFunc(func() (Row, error) {
-		k, v, ok, err := it.next()
+		k, v, ok, err := it.Next()
 		if err != nil || !ok {
 			return nil, err
 		}
@@ -138,7 +138,7 @@ func (n *scanNode) open(db *DB) (iterator, error) {
 		if n.path.index != nil {
 			// An index entry's value is the row's primary key; fetch the row.
 			pk = v
-			if v, ok, err = db.tree.Get(rowKey(t.ID, pk)); err != nil {
+			if v, ok, err = tx.kv.Get(rowKey(t.ID, pk)); err != nil {
 				return nil, err
 			} else if !ok {
 				return nil, fmt.Errorf("engine: index %q points to a missing row", n.path.index.Name)
@@ -168,8 +168,8 @@ type filterNode struct {
 func (n *filterNode) explain() string    { return "Filter: " + n.cond }
 func (n *filterNode) inputs() []planNode { return []planNode{n.input} }
 
-func (n *filterNode) open(db *DB) (iterator, error) {
-	in, err := n.input.open(db)
+func (n *filterNode) open(tx *txn) (iterator, error) {
+	in, err := n.input.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -203,8 +203,8 @@ type projectNode struct {
 func (n *projectNode) explain() string    { return "Project: " + strings.Join(n.names, ", ") }
 func (n *projectNode) inputs() []planNode { return []planNode{n.input} }
 
-func (n *projectNode) open(db *DB) (iterator, error) {
-	in, err := n.input.open(db)
+func (n *projectNode) open(tx *txn) (iterator, error) {
+	in, err := n.input.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -232,8 +232,8 @@ type distinctNode struct {
 func (n *distinctNode) explain() string    { return "Distinct" }
 func (n *distinctNode) inputs() []planNode { return []planNode{n.input} }
 
-func (n *distinctNode) open(db *DB) (iterator, error) {
-	in, err := n.input.open(db)
+func (n *distinctNode) open(tx *txn) (iterator, error) {
+	in, err := n.input.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +271,8 @@ func (n *limitNode) explain() string {
 }
 func (n *limitNode) inputs() []planNode { return []planNode{n.input} }
 
-func (n *limitNode) open(db *DB) (iterator, error) {
-	in, err := n.input.open(db)
+func (n *limitNode) open(tx *txn) (iterator, error) {
+	in, err := n.input.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -315,8 +315,8 @@ type sortNode struct {
 func (n *sortNode) explain() string    { return "Sort: " + n.desc }
 func (n *sortNode) inputs() []planNode { return []planNode{n.input} }
 
-func (n *sortNode) open(db *DB) (iterator, error) {
-	in, err := n.input.open(db)
+func (n *sortNode) open(tx *txn) (iterator, error) {
+	in, err := n.input.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -367,8 +367,8 @@ func (n *nestedLoopJoinNode) explain() string {
 }
 func (n *nestedLoopJoinNode) inputs() []planNode { return []planNode{n.left, n.right} }
 
-func (n *nestedLoopJoinNode) open(db *DB) (iterator, error) {
-	rin, err := n.right.open(db)
+func (n *nestedLoopJoinNode) open(tx *txn) (iterator, error) {
+	rin, err := n.right.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +376,7 @@ func (n *nestedLoopJoinNode) open(db *DB) (iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	lin, err := n.left.open(db)
+	lin, err := n.left.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -423,8 +423,8 @@ type hashJoinNode struct {
 func (n *hashJoinNode) explain() string    { return "Hash Join: " + n.desc }
 func (n *hashJoinNode) inputs() []planNode { return []planNode{n.left, n.right} }
 
-func (n *hashJoinNode) open(db *DB) (iterator, error) {
-	rin, err := n.right.open(db)
+func (n *hashJoinNode) open(tx *txn) (iterator, error) {
+	rin, err := n.right.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +446,7 @@ func (n *hashJoinNode) open(db *DB) (iterator, error) {
 			table[hk] = append(table[hk], r)
 		}
 	}
-	lin, err := n.left.open(db)
+	lin, err := n.left.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -500,8 +500,8 @@ type group struct {
 	accs []accumulator
 }
 
-func (n *aggregateNode) open(db *DB) (iterator, error) {
-	in, err := n.input.open(db)
+func (n *aggregateNode) open(tx *txn) (iterator, error) {
+	in, err := n.input.open(tx)
 	if err != nil {
 		return nil, err
 	}

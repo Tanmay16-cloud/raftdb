@@ -5,17 +5,56 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 
+	"raftdb/internal/mvcc"
 	"raftdb/internal/parser"
 	"raftdb/internal/storage"
 )
 
-// DB is a SQL database stored in a single B+ tree. It is used by one
-// session at a time; concurrent transactions arrive with MVCC.
+// ErrConflict is returned (wrapped) when a transaction collides with a
+// concurrent one. The transaction has been rolled back and can be retried.
+var ErrConflict = mvcc.ErrConflict
+
+// DB is a SQL database. It is safe for concurrent use: each Session runs
+// its own transactions, isolated from the others by MVCC.
 type DB struct {
-	tree   *storage.BTree
-	tables map[string]*Table
-	inTxn  bool // inside BEGIN ... COMMIT
+	tree  *storage.BTree
+	store *mvcc.Store
+
+	// mu orders transaction starts and commits for the schema change rule
+	// (see txn.commit). commitSeq counts commits that wrote something, and
+	// schemaSeq is the commitSeq of the last one that changed the schema.
+	mu                   sync.Mutex
+	commitSeq, schemaSeq uint64
+
+	// The catalog as of schemaSeq catalogSeq, shared read-only by
+	// transactions (see begin).
+	catalog      map[string]*Table
+	catalogSeq   uint64
+	catalogValid bool
+
+	// The session behind DB.Exec and friends.
+	defMu sync.Mutex
+	def   *Session
+}
+
+// Session is one connection's view of the database: a sequence of
+// statements, possibly grouped into transactions. A Session must be used
+// by one goroutine at a time.
+type Session struct {
+	db *DB
+	tx *txn // the open BEGIN ... COMMIT transaction, if any
+}
+
+// txn is the state of one transaction: its MVCC transaction and the
+// catalog as its snapshot sees it.
+type txn struct {
+	db       *DB
+	kv       *mvcc.Txn
+	tables   map[string]*Table
+	startSeq uint64
+	ddl      bool // changed the schema
 }
 
 // Result is the outcome of one statement.
@@ -36,38 +75,93 @@ func OpenWithOptions(path string, opts storage.Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db := &DB{tree: tree}
-	if err := db.loadCatalog(); err != nil {
+	store, err := mvcc.Open(tree)
+	if err != nil {
 		tree.Close()
 		return nil, err
 	}
+	db := &DB{tree: tree, store: store}
+	db.def = db.Session()
 	return db, nil
 }
 
-// Close closes the database. An open transaction is rolled back.
+// Session starts a new session.
+func (db *DB) Session() *Session { return &Session{db: db} }
+
+// Close closes the database. The default session's open transaction is
+// rolled back; other sessions should be closed first.
 func (db *DB) Close() error {
-	if db.inTxn {
-		db.tree.Rollback()
-	}
+	db.defMu.Lock()
+	db.def.Close()
+	db.defMu.Unlock()
 	return db.tree.Close()
 }
-
-// InTransaction reports whether a BEGIN is waiting for COMMIT or ROLLBACK.
-func (db *DB) InTransaction() bool { return db.inTxn }
 
 // Stats returns the storage engine's activity counters.
 func (db *DB) Stats() storage.Stats { return db.tree.Stats() }
 
+// Exec, Query, ExecStatement, InTransaction, Tables and Table use the
+// database's default session.
+
+func (db *DB) Exec(sql string) ([]*Result, error) {
+	db.defMu.Lock()
+	defer db.defMu.Unlock()
+	return db.def.Exec(sql)
+}
+
+func (db *DB) Query(sql string) (*Result, error) {
+	db.defMu.Lock()
+	defer db.defMu.Unlock()
+	return db.def.Query(sql)
+}
+
+func (db *DB) ExecStatement(s parser.Statement) (*Result, error) {
+	db.defMu.Lock()
+	defer db.defMu.Unlock()
+	return db.def.ExecStatement(s)
+}
+
+func (db *DB) InTransaction() bool {
+	db.defMu.Lock()
+	defer db.defMu.Unlock()
+	return db.def.InTransaction()
+}
+
+func (db *DB) Tables() []*Table {
+	db.defMu.Lock()
+	defer db.defMu.Unlock()
+	return db.def.Tables()
+}
+
+func (db *DB) Table(name string) *Table {
+	db.defMu.Lock()
+	defer db.defMu.Unlock()
+	return db.def.Table(name)
+}
+
+// Close rolls back the session's open transaction, if any.
+func (s *Session) Close() error {
+	if s.tx == nil {
+		return nil
+	}
+	err := s.tx.rollback()
+	s.tx = nil
+	return err
+}
+
+// InTransaction reports whether a BEGIN is waiting for COMMIT or ROLLBACK.
+func (s *Session) InTransaction() bool { return s.tx != nil }
+
 // Exec parses and runs a script of statements. It stops at the first error
 // and returns the results of the statements before it.
-func (db *DB) Exec(sql string) ([]*Result, error) {
+func (s *Session) Exec(sql string) ([]*Result, error) {
 	stmts, err := parser.ParseAll(sql)
 	if err != nil {
 		return nil, err
 	}
 	var results []*Result
-	for _, s := range stmts {
-		r, err := db.ExecStatement(s)
+	for _, st := range stmts {
+		r, err := s.ExecStatement(st)
 		if err != nil {
 			return results, err
 		}
@@ -77,100 +171,214 @@ func (db *DB) Exec(sql string) ([]*Result, error) {
 }
 
 // Query runs a single statement and returns its result.
-func (db *DB) Query(sql string) (*Result, error) {
-	s, err := parser.Parse(sql)
+func (s *Session) Query(sql string) (*Result, error) {
+	st, err := parser.Parse(sql)
 	if err != nil {
 		return nil, err
 	}
-	return db.ExecStatement(s)
+	return s.ExecStatement(st)
 }
 
 // ExecStatement runs one parsed statement.
 //
-// Every statement is atomic. Outside a transaction, each statement commits
-// on success; if it fails partway (say, the third row of an INSERT
-// violates the primary key), the storage engine rolls back to the last
-// commit, so the first two rows vanish too. Inside BEGIN ... COMMIT, the
-// changes accumulate until COMMIT. An error inside a transaction rolls back
-// the whole transaction, because the storage engine can only roll back to
-// the last commit (statement-level savepoints would need more machinery).
-func (db *DB) ExecStatement(s parser.Statement) (*Result, error) {
-	switch s.(type) {
+// Outside BEGIN ... COMMIT, each statement runs in a transaction of its own
+// (read-only for queries), so it is atomic: if the third row of an INSERT
+// violates the primary key, the first two vanish too. Inside a transaction,
+// an error rolls back the whole transaction, since there are no savepoints.
+func (s *Session) ExecStatement(st parser.Statement) (*Result, error) {
+	switch st.(type) {
 	case *parser.Begin:
-		if db.inTxn {
+		if s.tx != nil {
 			return nil, errors.New("a transaction is already in progress")
 		}
-		db.inTxn = true
+		tx, err := s.db.begin(false)
+		if err != nil {
+			return nil, err
+		}
+		s.tx = tx
 		return &Result{Message: "BEGIN"}, nil
 	case *parser.Commit:
-		if !db.inTxn {
+		if s.tx == nil {
 			return nil, errors.New("no transaction in progress")
 		}
-		db.inTxn = false
-		if err := db.tree.Sync(); err != nil {
-			return nil, db.abort(err)
+		tx := s.tx
+		s.tx = nil
+		if err := tx.commit(); err != nil {
+			return nil, err
 		}
 		return &Result{Message: "COMMIT"}, nil
 	case *parser.Rollback:
-		if !db.inTxn {
+		if s.tx == nil {
 			return nil, errors.New("no transaction in progress")
 		}
-		db.inTxn = false
-		if err := db.abort(nil); err != nil {
+		if err := s.Close(); err != nil {
 			return nil, err
 		}
 		return &Result{Message: "ROLLBACK"}, nil
+	case *parser.Vacuum:
+		if s.tx != nil {
+			return nil, errors.New("VACUUM cannot run inside a transaction")
+		}
+		n, err := s.db.store.Vacuum()
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Message: fmt.Sprintf("VACUUM %d", n)}, nil
 	}
 
-	res, err := db.run(s)
-	if err != nil {
-		if db.inTxn {
-			db.inTxn = false
-			return nil, fmt.Errorf("%w (the transaction was rolled back)", db.abort(err))
+	if s.tx != nil {
+		res, err := s.tx.run(st)
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("%w (the transaction was rolled back)", err)
 		}
-		return nil, db.abort(err)
+		return res, nil
 	}
-	if !db.inTxn {
-		if err := db.tree.Sync(); err != nil {
-			return nil, db.abort(err)
-		}
+	_, query := st.(*parser.Select)
+	_, explain := st.(*parser.Explain)
+	tx, err := s.db.begin(query || explain)
+	if err != nil {
+		return nil, err
+	}
+	res, err := tx.run(st)
+	if err != nil {
+		tx.rollback()
+		return nil, err
+	}
+	if err := tx.commit(); err != nil {
+		return nil, err
 	}
 	return res, nil
 }
 
-// abort discards uncommitted changes, reloads the catalog they may have
-// touched, and returns cause (or the rollback's own error if cause is nil).
-func (db *DB) abort(cause error) error {
-	err := db.tree.Rollback()
-	if err == nil {
-		err = db.loadCatalog()
+// Tables returns the definitions of every table, as the session's
+// transaction (or, outside one, the latest committed state) sees them.
+func (s *Session) Tables() []*Table {
+	tables := s.catalog()
+	out := make([]*Table, 0, len(tables))
+	for _, t := range tables {
+		out = append(out, t)
 	}
-	if cause != nil {
-		return cause
-	}
-	return err
+	slices.SortFunc(out, func(a, b *Table) int { return strings.Compare(a.Name, b.Name) })
+	return out
 }
 
-func (db *DB) run(s parser.Statement) (*Result, error) {
+// Table returns the definition of one table, or nil.
+func (s *Session) Table(name string) *Table { return s.catalog()[name] }
+
+func (s *Session) catalog() map[string]*Table {
+	if s.tx != nil {
+		return s.tx.tables
+	}
+	tx, err := s.db.begin(true)
+	if err != nil {
+		return nil
+	}
+	defer tx.rollback()
+	return tx.tables
+}
+
+// ---------------------------------------------------------------------------
+// Transactions
+
+// begin starts a transaction.
+//
+// Decoding the catalog for every statement would be slow, so the database
+// caches it. A transaction sees every schema change committed before it
+// began and none after, which is exactly the cached catalog if no schema
+// change has committed since the cache was loaded. Transactions share the
+// cached map until one changes the schema (see ownCatalog).
+func (db *DB) begin(readOnly bool) (*txn, error) {
+	db.mu.Lock()
+	tx := &txn{db: db, startSeq: db.commitSeq}
+	var err error
+	if readOnly {
+		tx.kv = db.store.BeginReadOnly()
+	} else {
+		tx.kv, err = db.store.Begin()
+	}
+	schemaSeq := db.schemaSeq
+	cached := db.catalogValid && db.catalogSeq == schemaSeq
+	tx.tables = db.catalog
+	db.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if cached {
+		return tx, nil
+	}
+	if err := tx.loadCatalog(); err != nil {
+		tx.kv.Rollback()
+		return nil, err
+	}
+	db.mu.Lock()
+	if db.schemaSeq == schemaSeq {
+		db.catalog, db.catalogSeq, db.catalogValid = tx.tables, schemaSeq, true
+	}
+	db.mu.Unlock()
+	return tx, nil
+}
+
+// commit commits the transaction, or rolls it back if it would break the
+// schema change rule.
+//
+// Snapshot isolation alone doesn't protect schema changes. CREATE INDEX
+// fills the index from its snapshot, so a row that a concurrent
+// transaction inserts would be missing from it; and rows inserted
+// concurrently with DROP TABLE would be left behind. Neither collides on a
+// key, so MVCC sees no conflict. The rule is coarse but safe: a transaction
+// that changed the schema commits only if no other transaction has
+// committed writes since it began, and a transaction that wrote data
+// commits only if no schema change has committed since it began. In effect
+// schema changes take a lock on the whole database, checked at commit.
+func (tx *txn) commit() error {
+	db := tx.db
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if tx.kv.Wrote() {
+		switch {
+		case tx.ddl && db.commitSeq != tx.startSeq:
+			tx.kv.Rollback()
+			return fmt.Errorf("%w: other transactions wrote data while this one changed the schema", ErrConflict)
+		case !tx.ddl && db.schemaSeq > tx.startSeq:
+			tx.kv.Rollback()
+			return fmt.Errorf("%w: another transaction changed the schema", ErrConflict)
+		}
+	}
+	if err := tx.kv.Commit(); err != nil {
+		return err
+	}
+	if tx.kv.Wrote() {
+		db.commitSeq++
+		if tx.ddl {
+			db.schemaSeq = db.commitSeq
+		}
+	}
+	return nil
+}
+
+func (tx *txn) rollback() error { return tx.kv.Rollback() }
+
+func (tx *txn) run(s parser.Statement) (*Result, error) {
 	switch s := s.(type) {
 	case *parser.CreateTable:
-		return db.createTable(s)
+		return tx.createTable(s)
 	case *parser.DropTable:
-		return db.dropTable(s)
+		return tx.dropTable(s)
 	case *parser.CreateIndex:
-		return db.createIndex(s)
+		return tx.createIndex(s)
 	case *parser.DropIndex:
-		return db.dropIndex(s)
+		return tx.dropIndex(s)
 	case *parser.Insert:
-		return db.insert(s)
+		return tx.insert(s)
 	case *parser.Update:
-		return db.update(s)
+		return tx.update(s)
 	case *parser.Delete:
-		return db.delete(s)
+		return tx.delete(s)
 	case *parser.Select:
-		return db.selectRows(s)
+		return tx.selectRows(s)
 	case *parser.Explain:
-		return db.explain(s.Query)
+		return tx.explain(s.Query)
 	}
 	return nil, fmt.Errorf("unsupported statement %T", s)
 }
@@ -178,94 +386,40 @@ func (db *DB) run(s parser.Statement) (*Result, error) {
 // ---------------------------------------------------------------------------
 // Storage access
 
-// rangeIter walks the keys in [start, end). The storage engine's Scan holds
-// the tree's lock while it calls back, so rangeIter reads a batch of entries
-// at a time and resumes after the last key. Between batches the caller is
-// free to run other tree operations, such as fetching a row for an index
-// entry.
-type rangeIter struct {
-	tree       *storage.BTree
-	start, end []byte
-	batch      []kv
-	i          int
-	done       bool
-}
+func (tx *txn) scan(start, end []byte) *mvcc.Iterator { return tx.kv.Scan(start, end) }
 
-type kv struct{ k, v []byte }
-
-const scanBatch = 256
-
-func (db *DB) scan(start, end []byte) *rangeIter {
-	return &rangeIter{tree: db.tree, start: start, end: end}
-}
-
-func (it *rangeIter) next() (key, value []byte, ok bool, err error) {
-	if it.i == len(it.batch) {
-		if it.done {
-			return nil, nil, false, nil
-		}
-		it.batch, it.i = it.batch[:0], 0
-		err := it.tree.Scan(it.start, it.end, func(k, v []byte) bool {
-			it.batch = append(it.batch, kv{k, v})
-			return len(it.batch) < scanBatch
-		})
-		if err != nil {
-			return nil, nil, false, err
-		}
-		if len(it.batch) < scanBatch {
-			it.done = true
-		}
-		if len(it.batch) == 0 {
-			return nil, nil, false, nil
-		}
-		// The smallest key after the last one in this batch.
-		it.start = append(slices.Clip(it.batch[len(it.batch)-1].k), 0)
-	}
-	e := it.batch[it.i]
-	it.i++
-	return e.k, e.v, true, nil
-}
-
-// deleteRange removes every key in [start, end).
-func (db *DB) deleteRange(start, end []byte) error {
+// deleteRange removes every key in [start, end). Deleted keys vanish from
+// the transaction's own view, so each pass rescans from the start.
+func (tx *txn) deleteRange(start, end []byte) error {
 	for {
 		var keys [][]byte
-		err := db.tree.Scan(start, end, func(k, _ []byte) bool {
+		it := tx.scan(start, end)
+		for len(keys) < 256 {
+			k, _, ok, err := it.Next()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
 			keys = append(keys, k)
-			return len(keys) < scanBatch
-		})
-		if err != nil {
-			return err
 		}
 		if len(keys) == 0 {
 			return nil
 		}
 		for _, k := range keys {
-			if _, err := db.tree.Delete(k); err != nil {
+			if _, err := tx.kv.Delete(k); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (db *DB) exists(start, end []byte) (bool, error) {
-	found := false
-	err := db.tree.Scan(start, end, func(_, _ []byte) bool {
-		found = true
-		return false
-	})
-	return found, err
-}
-
 func checkKeySize(key []byte, what string) error {
-	if len(key) > storage.MaxKeySize {
-		return fmt.Errorf("%s is too long to store in a key (%d bytes encoded; the limit is %d)", what, len(key), storage.MaxKeySize)
+	if mvcc.CheckKey(key) != nil {
+		return fmt.Errorf("%s is too long to store in a key (%d bytes encoded)", what, len(key))
 	}
 	return nil
-}
-
-func slicesSortByName(ts []*Table) {
-	slices.SortFunc(ts, func(a, b *Table) int { return strings.Compare(a.Name, b.Name) })
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +434,11 @@ func checkName(kind, name string) error {
 	return nil
 }
 
-func (db *DB) createTable(s *parser.CreateTable) (*Result, error) {
+func (tx *txn) createTable(s *parser.CreateTable) (*Result, error) {
 	if err := checkName("table", s.Name); err != nil {
 		return nil, err
 	}
-	if _, ok := db.tables[s.Name]; ok {
+	if _, ok := tx.tables[s.Name]; ok {
 		if s.IfNotExists {
 			return &Result{Message: "CREATE TABLE"}, nil
 		}
@@ -306,19 +460,19 @@ func (db *DB) createTable(s *parser.CreateTable) (*Result, error) {
 		}
 		t.Columns = append(t.Columns, Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull || c.PrimaryKey})
 	}
-	id, err := db.nextID()
+	id, err := tx.nextID()
 	if err != nil {
 		return nil, err
 	}
 	t.ID = id
-	if err := db.saveTable(t); err != nil {
+	if err := tx.saveTable(t); err != nil {
 		return nil, err
 	}
 	return &Result{Message: "CREATE TABLE"}, nil
 }
 
-func (db *DB) dropTable(s *parser.DropTable) (*Result, error) {
-	t, ok := db.tables[s.Name]
+func (tx *txn) dropTable(s *parser.DropTable) (*Result, error) {
+	t, ok := tx.tables[s.Name]
 	if !ok {
 		if s.IfExists {
 			return &Result{Message: "DROP TABLE"}, nil
@@ -327,34 +481,33 @@ func (db *DB) dropTable(s *parser.DropTable) (*Result, error) {
 	}
 	for _, idx := range t.Indexes {
 		p := indexPrefix(idx.ID)
-		if err := db.deleteRange(p, prefixEnd(p)); err != nil {
+		if err := tx.deleteRange(p, prefixEnd(p)); err != nil {
 			return nil, err
 		}
 	}
 	p := rowPrefix(t.ID)
-	if err := db.deleteRange(p, prefixEnd(p)); err != nil {
+	if err := tx.deleteRange(p, prefixEnd(p)); err != nil {
 		return nil, err
 	}
-	for _, k := range [][]byte{rowIDKey(t.ID), catalogKey(t.Name)} {
-		if _, err := db.tree.Delete(k); err != nil {
-			return nil, err
-		}
+	if _, err := tx.kv.Delete(catalogKey(t.Name)); err != nil {
+		return nil, err
 	}
-	delete(db.tables, t.Name)
+	tx.ownCatalog()
+	delete(tx.tables, t.Name)
 	return &Result{Message: "DROP TABLE"}, nil
 }
 
-func (db *DB) createIndex(s *parser.CreateIndex) (*Result, error) {
+func (tx *txn) createIndex(s *parser.CreateIndex) (*Result, error) {
 	if err := checkName("index", s.Name); err != nil {
 		return nil, err
 	}
-	if t, _ := db.findIndex(s.Name); t != nil {
+	if t, _ := tx.findIndex(s.Name); t != nil {
 		if s.IfNotExists {
 			return &Result{Message: "CREATE INDEX"}, nil
 		}
 		return nil, fmt.Errorf("index %q already exists", s.Name)
 	}
-	t, err := db.table(s.Table)
+	t, err := tx.table(s.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +515,7 @@ func (db *DB) createIndex(s *parser.CreateIndex) (*Result, error) {
 	if col < 0 {
 		return nil, fmt.Errorf("column %q of table %q does not exist", s.Column, s.Table)
 	}
-	id, err := db.nextID()
+	id, err := tx.nextID()
 	if err != nil {
 		return nil, err
 	}
@@ -370,9 +523,9 @@ func (db *DB) createIndex(s *parser.CreateIndex) (*Result, error) {
 
 	// Backfill the index from the existing rows. A unique index fails here if
 	// the column already holds duplicates.
-	it := db.scan(rowPrefix(t.ID), prefixEnd(rowPrefix(t.ID)))
+	it := tx.scan(rowPrefix(t.ID), prefixEnd(rowPrefix(t.ID)))
 	for {
-		k, v, ok, err := it.next()
+		k, v, ok, err := it.Next()
 		if err != nil {
 			return nil, err
 		}
@@ -383,20 +536,20 @@ func (db *DB) createIndex(s *parser.CreateIndex) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := db.addIndexEntry(t, idx, row, k[len(rowPrefix(t.ID)):]); err != nil {
+		if err := tx.addIndexEntry(t, idx, row, k[len(rowPrefix(t.ID)):]); err != nil {
 			return nil, err
 		}
 	}
 	t2 := *t
 	t2.Indexes = append(slices.Clip(t.Indexes), idx)
-	if err := db.saveTable(&t2); err != nil {
+	if err := tx.saveTable(&t2); err != nil {
 		return nil, err
 	}
 	return &Result{Message: "CREATE INDEX"}, nil
 }
 
-func (db *DB) dropIndex(s *parser.DropIndex) (*Result, error) {
-	t, i := db.findIndex(s.Name)
+func (tx *txn) dropIndex(s *parser.DropIndex) (*Result, error) {
+	t, i := tx.findIndex(s.Name)
 	if t == nil {
 		if s.IfExists {
 			return &Result{Message: "DROP INDEX"}, nil
@@ -404,12 +557,12 @@ func (db *DB) dropIndex(s *parser.DropIndex) (*Result, error) {
 		return nil, fmt.Errorf("index %q does not exist", s.Name)
 	}
 	p := indexPrefix(t.Indexes[i].ID)
-	if err := db.deleteRange(p, prefixEnd(p)); err != nil {
+	if err := tx.deleteRange(p, prefixEnd(p)); err != nil {
 		return nil, err
 	}
 	t2 := *t
 	t2.Indexes = slices.Delete(slices.Clone(t.Indexes), i, i+1)
-	if err := db.saveTable(&t2); err != nil {
+	if err := tx.saveTable(&t2); err != nil {
 		return nil, err
 	}
 	return &Result{Message: "DROP INDEX"}, nil
@@ -435,11 +588,11 @@ func checkRow(t *Table, row Row) error {
 
 // primaryKey returns the encoded primary key for a new row: the key
 // column's value, or the next hidden row ID if the table has no key.
-func (db *DB) primaryKey(t *Table, row Row) ([]byte, error) {
+func (tx *txn) primaryKey(t *Table, row Row) ([]byte, error) {
 	if t.PK >= 0 {
 		return appendKey(nil, row[t.PK]), nil
 	}
-	id, err := db.counter(rowIDKey(t.ID))
+	id, err := tx.db.store.Sequence(rowIDKey(t.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -448,13 +601,13 @@ func (db *DB) primaryKey(t *Table, row Row) ([]byte, error) {
 
 // writeRow stores a row and its index entries. The caller has already
 // checked the row with checkRow.
-func (db *DB) writeRow(t *Table, row Row, pk []byte) error {
+func (tx *txn) writeRow(t *Table, row Row, pk []byte) error {
 	key := rowKey(t.ID, pk)
 	if err := checkKeySize(key, "primary key value"); err != nil {
 		return err
 	}
 	if t.PK >= 0 {
-		_, dup, err := db.tree.Get(key)
+		_, dup, err := tx.kv.Get(key)
 		if err != nil {
 			return err
 		}
@@ -463,42 +616,41 @@ func (db *DB) writeRow(t *Table, row Row, pk []byte) error {
 		}
 	}
 	val := encodeRow(row)
-	if len(val) > storage.MaxValueSize {
-		return fmt.Errorf("row is too large (%d bytes; the limit is %d)", len(val), storage.MaxValueSize)
+	if len(val) > mvcc.MaxValueSize {
+		return fmt.Errorf("row is too large (%d bytes; the limit is %d)", len(val), mvcc.MaxValueSize)
 	}
-	if err := db.tree.Put(key, val); err != nil {
+	if err := tx.kv.Put(key, val); err != nil {
 		return err
 	}
 	for _, idx := range t.Indexes {
-		if err := db.addIndexEntry(t, idx, row, pk); err != nil {
+		if err := tx.addIndexEntry(t, idx, row, pk); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (db *DB) deleteRow(t *Table, row Row, pk []byte) error {
-	if _, err := db.tree.Delete(rowKey(t.ID, pk)); err != nil {
+func (tx *txn) deleteRow(t *Table, row Row, pk []byte) error {
+	if _, err := tx.kv.Delete(rowKey(t.ID, pk)); err != nil {
 		return err
 	}
 	for _, idx := range t.Indexes {
-		if _, err := db.tree.Delete(indexKey(idx.ID, row[idx.Column], pk)); err != nil {
+		if _, err := tx.kv.Delete(indexKey(idx, row[idx.Column], pk)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (db *DB) addIndexEntry(t *Table, idx *Index, row Row, pk []byte) error {
+func (tx *txn) addIndexEntry(t *Table, idx *Index, row Row, pk []byte) error {
 	v := row[idx.Column]
-	key := indexKey(idx.ID, v, pk)
+	key := indexKey(idx, v, pk)
 	if err := checkKeySize(key, fmt.Sprintf("value of indexed column %q", t.Columns[idx.Column].Name)); err != nil {
 		return err
 	}
 	// Several NULLs may share a unique index: NULL is never equal to NULL.
 	if idx.Unique && v != nil {
-		p := appendKey(indexPrefix(idx.ID), v)
-		dup, err := db.exists(p, prefixEnd(p))
+		_, dup, err := tx.kv.Get(key)
 		if err != nil {
 			return err
 		}
@@ -506,11 +658,11 @@ func (db *DB) addIndexEntry(t *Table, idx *Index, row Row, pk []byte) error {
 			return fmt.Errorf("duplicate key value violates unique index %q: %s = %s already exists", idx.Name, t.Columns[idx.Column].Name, literal(v))
 		}
 	}
-	return db.tree.Put(key, pk)
+	return tx.kv.Put(key, pk)
 }
 
-func (db *DB) insert(s *parser.Insert) (*Result, error) {
-	t, err := db.table(s.Table)
+func (tx *txn) insert(s *parser.Insert) (*Result, error) {
+	t, err := tx.table(s.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -552,11 +704,11 @@ func (db *DB) insert(s *parser.Insert) (*Result, error) {
 		if err := checkRow(t, row); err != nil {
 			return nil, err
 		}
-		pk, err := db.primaryKey(t, row)
+		pk, err := tx.primaryKey(t, row)
 		if err != nil {
 			return nil, err
 		}
-		if err := db.writeRow(t, row, pk); err != nil {
+		if err := tx.writeRow(t, row, pk); err != nil {
 			return nil, err
 		}
 	}
@@ -568,12 +720,12 @@ func (db *DB) insert(s *parser.Insert) (*Result, error) {
 // any. Changing rows during the scan could make it see a row twice: an
 // update that moves a row forward in the index being scanned would meet it
 // again later (the "Halloween problem").
-func (db *DB) matchRows(t *Table, where parser.Expr) (rows []Row, pks [][]byte, err error) {
-	plan, err := db.planTableScan(t, t.Name, where, true)
+func (tx *txn) matchRows(t *Table, where parser.Expr) (rows []Row, pks [][]byte, err error) {
+	plan, err := tx.planTableScan(t, t.Name, where, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	it, err := plan.open(db)
+	it, err := plan.open(tx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -591,25 +743,25 @@ func (db *DB) matchRows(t *Table, where parser.Expr) (rows []Row, pks [][]byte, 
 	}
 }
 
-func (db *DB) delete(s *parser.Delete) (*Result, error) {
-	t, err := db.table(s.Table)
+func (tx *txn) delete(s *parser.Delete) (*Result, error) {
+	t, err := tx.table(s.Table)
 	if err != nil {
 		return nil, err
 	}
-	rows, pks, err := db.matchRows(t, s.Where)
+	rows, pks, err := tx.matchRows(t, s.Where)
 	if err != nil {
 		return nil, err
 	}
 	for i := range rows {
-		if err := db.deleteRow(t, rows[i], pks[i]); err != nil {
+		if err := tx.deleteRow(t, rows[i], pks[i]); err != nil {
 			return nil, err
 		}
 	}
 	return &Result{Message: fmt.Sprintf("DELETE %d", len(rows))}, nil
 }
 
-func (db *DB) update(s *parser.Update) (*Result, error) {
-	t, err := db.table(s.Table)
+func (tx *txn) update(s *parser.Update) (*Result, error) {
+	t, err := tx.table(s.Table)
 	if err != nil {
 		return nil, err
 	}
@@ -636,7 +788,7 @@ func (db *DB) update(s *parser.Update) (*Result, error) {
 		set = append(set, assignment{col, f})
 	}
 
-	rows, pks, err := db.matchRows(t, s.Where)
+	rows, pks, err := tx.matchRows(t, s.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -665,12 +817,12 @@ func (db *DB) update(s *parser.Update) (*Result, error) {
 	// depends on the plan). Replacing rows one at a time would fail when an
 	// early row moved onto a later row's key before that row had moved away.
 	for i, old := range rows {
-		if err := db.deleteRow(t, old, pks[i]); err != nil {
+		if err := tx.deleteRow(t, old, pks[i]); err != nil {
 			return nil, err
 		}
 	}
 	for i, row := range newRows {
-		if err := db.writeRow(t, row, newPKs[i]); err != nil {
+		if err := tx.writeRow(t, row, newPKs[i]); err != nil {
 			return nil, err
 		}
 	}

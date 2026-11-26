@@ -4,9 +4,10 @@ A distributed SQL database built from scratch in Go: a SQL front end, a
 B+ tree storage engine with a write-ahead log, MVCC transactions, and Raft
 replication across nodes.
 
-> Status: **Milestone 4 of 7 complete.** raftdb runs SQL on a single node:
-> tables, secondary indexes, joins, aggregates and transactions, planned by a
-> rule-based optimizer and executed on a crash-safe storage engine.
+> Status: **Milestone 5 of 7 complete.** raftdb runs SQL on a single node:
+> tables, secondary indexes, joins and aggregates, planned by a rule-based
+> optimizer, with concurrent sessions isolated by MVCC (snapshot isolation),
+> on a crash-safe storage engine.
 
 ## Architecture (target)
 
@@ -14,7 +15,7 @@ replication across nodes.
  client ──gRPC──▶ SQL layer        lexer → parser → planner → executor
                      │             rows and indexes encoded as key/value pairs
                      ▼
-                  Transactions     MVCC, snapshot isolation
+                  Transactions     MVCC versions, snapshot isolation
                      │
                      ▼
                   Raft             leader election, log replication, snapshots
@@ -41,7 +42,11 @@ replication across nodes.
       hash joins and nested-loop joins, `EXPLAIN`, and atomic statements and
       transactions. Verified by differential testing of index plans against
       full scans.
-- [ ] **5. Transactions.** MVCC with snapshot isolation.
+- [x] **5. Transactions.** MVCC with snapshot isolation: concurrent
+      sessions, readers that never block, write-conflict detection,
+      crash recovery of unfinished transactions, and `VACUUM`. Verified
+      against a reference model of snapshot isolation, with injected
+      crashes.
 - [ ] **6. Replication.** Raft over gRPC, tested with injected partitions and
       crashes.
 - [ ] **7. Server and benchmarks.** gRPC server, client, throughput and
@@ -51,7 +56,8 @@ replication across nodes.
 
 ```sh
 go test ./...                                    # run the test suite
-go test ./internal/storage -run=XXX -bench=.     # run the benchmarks
+go test ./internal/storage -run=XXX -bench=.     # storage benchmarks
+go test ./internal/engine -run=XXX -bench=.      # SQL benchmarks
 go run ./cmd/raftdb -db demo.db                  # SQL shell
 go test ./internal/parser -fuzz=FuzzParse -fuzztime=60s   # fuzz the parser
 ```
@@ -110,18 +116,20 @@ and an executor.
 
 ### Everything is a key
 
-The whole database lives in the B+ tree's single ordered key space:
+The whole database lives in one ordered key space, which the MVCC layer
+(Milestone 5) versions:
 
 | Key | Value |
 |---|---|
 | `c/<table name>` | table definition (JSON) |
-| `s/next-id` | the next table or index ID |
 | `r` + table ID + primary key | the row |
 | `x` + index ID + indexed value + primary key | the primary key |
-| `q` + table ID | the next hidden row ID (tables without a primary key) |
+| `x` + index ID + indexed value (unique index, non-NULL value) | the primary key |
 
 IDs are 4-byte big-endian, so a table's rows, and an index's entries, sit
-next to each other and a prefix scan reads exactly them.
+next to each other and a prefix scan reads exactly them. Table and index
+IDs, and the hidden row IDs of tables without a primary key, come from
+non-transactional sequences, so they are never reused.
 
 Primary keys and indexed values use an **order-preserving encoding**:
 comparing two encodings byte by byte gives the same answer as comparing the
@@ -138,9 +146,12 @@ AND 30`.
   `("ab", …)`.
 - `NULL`, `FALSE` and `TRUE` are single tag bytes.
 
-Appending the primary key to each index key keeps duplicate values distinct,
-and the entry's value is the primary key, so an index scan fetches each row
-with one more lookup. Rows themselves use a compact format (varints and
+Appending the primary key to each index key keeps duplicate values
+distinct. A unique index leaves it off, so that two concurrent transactions
+inserting the same value write the same key and MVCC catches the conflict.
+NULLs, any number of which may share a unique index, keep it. An entry's
+value is the primary key, so an index scan fetches each row with one more
+lookup. Rows themselves use a compact format (varints and
 length-prefixed strings) that need not preserve order.
 
 ### Planning
@@ -198,11 +209,10 @@ Semantics follow PostgreSQL where it matters:
 - **Grouping.** Column references are checked against `GROUP BY`.
 
 **Atomic statements and transactions.** Outside `BEGIN`, each statement
-commits on its own. If it fails, the storage engine rolls back everything
-since the last commit, so a multi-row `INSERT` that hits a duplicate on its
-third row leaves nothing behind, index entries included. Inside
-`BEGIN … COMMIT`, an error rolls back the whole transaction, because the
-storage engine can only roll back to the last commit.
+runs in a transaction of its own (read-only for queries). So a multi-row
+`INSERT` that hits a duplicate on its third row leaves nothing behind,
+index entries included. Inside `BEGIN … COMMIT`, an error rolls back the
+whole transaction, since there are no savepoints.
 
 **UPDATE and DELETE** collect the matching rows before changing any, which
 avoids the "Halloween problem": an update that moves a row forward in the
@@ -231,7 +241,8 @@ row, can fail on that statement.
   indexes. Every random query must return the same rows from both, so every
   index plan is checked against a full scan. After every few hundred steps,
   each index must hold exactly one correct entry per row. An 8-page buffer
-  pool keeps the storage engine evicting throughout.
+  pool keeps the storage engine evicting throughout, and a `VACUUM` every
+  50 steps must not change any result.
 
 The differential test found two real bugs:
 - **Rollback kept uncommitted data.** A dirty page evicted to the log and then
@@ -252,6 +263,166 @@ Statement coverage: about 86%.
   in memory.
 - An index covers one column.
 - Errors inside a transaction abort it, since there are no savepoints.
+
+## Transactions: MVCC and snapshot isolation (Milestone 5)
+
+`internal/mvcc` sits between the SQL layer and the B+ tree, and lets many
+sessions run transactions at once. It uses **multi-version concurrency
+control**:
+- every write creates a new version of a key instead of overwriting it;
+- each transaction reads from a **snapshot** of the database as of when it
+  began.
+
+So readers never block writers, writers never block readers, and a
+transaction sees one consistent state however long it runs. This is the
+approach of PostgreSQL and of CockroachDB-style key/value stores.
+
+### Versions and visibility
+
+Each read-write transaction takes a version number from a counter when it
+begins, and stamps every version it writes with it. It also records which
+transactions were still active at that moment. A version written by
+transaction `v` is visible to transaction `t` if:
+
+```
+v == t.version                                    t's own write, or
+v <  t.version and v was not active when t began  committed before t
+```
+
+A rolled-back transaction's versions are deleted, so no one ever sees them.
+Committing changes no data at all: the transaction just leaves the active
+set, so snapshots taken after that include it. Read-only transactions (all
+autocommit `SELECT`s) take a snapshot without consuming a version or writing
+anything.
+
+Versions live in the tree under `v` + escaped key + 8-byte version. The key
+is escaped the same prefix-free, order-preserving way as text values, so all
+versions of a key are adjacent, oldest first. The versions of every key in
+`[start, end)` then form one contiguous range, which a scan reads in order,
+keeping the newest visible version of each key.
+
+### Conflicts: first writer wins
+
+Before writing a key, a transaction looks at the key's newest version. If
+that version isn't visible to it, another transaction either committed the
+key after this one began or is still writing it. The write then fails with
+a serialization error, and the client retries. In practice:
+
+| Session A | Session B | |
+|---|---|---|
+| `BEGIN` | `BEGIN` | |
+| `UPDATE accounts SET balance = balance - 30 WHERE id = 1` | | |
+| | `UPDATE accounts SET balance = balance - 20 WHERE id = 1` | **error**: could not serialize access due to a concurrent update |
+| `COMMIT` | | balance is 70, not a lost update |
+
+The same mechanism enforces uniqueness across sessions. Two concurrent
+inserts of the same primary key, or of the same value in a unique index,
+write the same key, so the second one fails.
+
+Snapshot isolation is **not serializable**: **write skew** is still possible.
+Two doctors are on call, and at least one must stay. Each transaction checks
+that the other doctor is on call and signs its own doctor off. The two
+transactions write different rows, so neither conflicts, and both commit.
+`TestWriteSkewIsPossible` demonstrates this. Serializable snapshot isolation,
+which also tracks read-write dependencies, is future work.
+
+### Schema changes
+
+MVCC alone doesn't make schema changes safe. `CREATE INDEX` fills the index
+from its snapshot, so it would miss a row inserted by a concurrent
+transaction. Rows inserted concurrently with `DROP TABLE` would be left
+behind. Neither case collides on a key, so MVCC sees no conflict.
+
+raftdb uses a coarse rule, checked at commit:
+- a transaction that changed the schema commits only if no other
+  transaction committed writes since it began;
+- a transaction that wrote data commits only if no schema change committed
+  since it began.
+
+In effect, DDL takes a lock on the whole database. Each transaction reads
+the catalog through its own snapshot, so uncommitted schema changes are
+invisible to other sessions. The decoded catalog is cached per committed
+schema version, so statements don't decode it every time.
+
+### Durability and recovery
+
+A transaction touches storage only on its first write. Before its first
+version, it records the version counter, so a crash can't hand that number
+out again, and an **active marker**. Commit deletes the marker and fsyncs,
+and only then leaves the in-memory active set, so no one can see the writes
+before they are durable. Transactions that wrote nothing never fsync.
+
+Each transaction keeps the set of keys it wrote in memory, for `ROLLBACK`.
+But every commit flushes the whole tree, including other transactions'
+uncommitted versions. After a crash, opening the database therefore deletes
+every version whose transaction is still marked active. That costs one scan
+over all versions after a crash, in exchange for writing nothing but the
+versions themselves during normal operation. An earlier design wrote a
+per-key undo record instead, and the extra writes made bulk inserts about
+1.8x slower.
+
+### Garbage collection: VACUUM
+
+Old versions accumulate, so `VACUUM` removes the ones no transaction can
+ever see again. The **horizon** is the oldest version that any open
+transaction might still need: the smallest of each open transaction's own
+version and the versions in its snapshot. For each key, only the newest
+version below the horizon matters to anyone. Older ones are deleted, and so
+is that newest one if it records a deletion. Vacuum doesn't run
+automatically yet. Until it does, tables that see many updates grow, and
+every read scans past the dead versions.
+
+### Testing MVCC
+
+- **Model-based test** (`mvcc_test.go`). Random interleavings of
+  overlapping transactions, read-write and read-only, run against a reference model of snapshot
+  isolation that knows nothing about versions. In the model:
+  - each transaction reads the committed state as of its start, overlaid
+    with its own writes;
+  - a write conflicts exactly when another transaction wrote the same key
+    and is still open, or committed after this one began.
+
+  The store must agree on every read, scan, delete and conflict. The run
+  includes vacuums and two kinds of injected crash: a power cut that loses
+  everything since the last fsync, and a crash after the storage engine has
+  flushed every open transaction's versions. After each crash the store must
+  hold exactly the committed state. Each seed runs 3,000 operations with a
+  4-page buffer pool, and 100 seeds passed. The model test caught its own bug
+  first: the model built a commit's new state from the transaction's
+  snapshot instead of from the latest committed state.
+- **Anomaly tests** (`internal/engine/mvcc_test.go`). With two sessions, the
+  tests check:
+  - no dirty reads, non-repeatable reads, or phantoms, including through an
+    index;
+  - lost updates and concurrent duplicate keys fail;
+  - write skew does happen;
+  - the schema-change rule holds in both orders;
+  - a transaction left open when the database closes is rolled back on
+    reopen;
+  - `VACUUM` never breaks an open snapshot.
+- **Concurrent bank transfers.** Four goroutines, each with its own session,
+  move money between accounts and retry on conflicts. Meanwhile, two readers
+  check that every snapshot sees the same total. A typical run commits 160
+  transfers and retries about 200 conflicts.
+- The engine's differential test also runs on top of MVCC, with `VACUUM`
+  every 50 steps. 30 seeds passed.
+
+The Go race detector needs a 64-bit C compiler, which the development
+machine lacks. I reviewed the shared state by hand: the store's counters and
+active set are guarded by its mutex, snapshots never change after `BEGIN`,
+and cached catalog maps are copied before a schema change modifies them.
+
+Statement coverage: about 86%.
+
+### Known limitations
+- Snapshot isolation, not serializable: write skew is possible.
+- A conflict fails immediately instead of waiting for the other transaction,
+  so clients must retry.
+- Schema changes conflict with every concurrent write, on any table.
+- `VACUUM` is manual and scans the whole database while holding the store's
+  lock.
+- Commits are serialized, one fsync each; group commit would batch them.
+- After a crash, recovery scans every version.
 
 ## SQL parser (Milestone 3)
 
@@ -440,3 +611,16 @@ i5-1235U laptop, Windows 11, 100-byte values, default 4 MB buffer pool:
 
 The gap between the first two rows is why databases use group commit: batching
 many commits into one fsync.
+
+**SQL layer** (`go test ./internal/engine -run=XXX -bench=.`). A table with
+an integer primary key, a secondary index and a text column, compared with
+Milestone 4, which had no MVCC:
+
+| Operation | Milestone 4 | With MVCC | Notes |
+|---|---|---|---|
+| `INSERT`, one transaction each | ~1.3–1.9 ms | ~1.3–1.6 ms | fsync-bound either way |
+| `INSERT`, 1,000 per transaction | ~86 µs | ~111 µs | each write first reads the key's versions to check for conflicts |
+| point `SELECT` by primary key | ~26 µs | ~22 µs | read-only snapshots write nothing; the catalog is cached |
+
+Most of what remains is the storage engine decoding a whole node on every
+visit. A cache of decoded nodes is the obvious next optimisation.

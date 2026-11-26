@@ -79,6 +79,7 @@ var canonicalCases = []struct{ in, want string }{
 	{"begin transaction", "BEGIN"},
 	{"COMMIT;", "COMMIT"},
 	{"rollback", "ROLLBACK"},
+	{"vacuum;", "VACUUM"},
 }
 
 func TestCanonicalForm(t *testing.T) {

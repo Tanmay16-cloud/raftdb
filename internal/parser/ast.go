@@ -159,6 +159,9 @@ type Explain struct {
 	Query *Select
 }
 
+// Vacuum removes row versions that no transaction can see any more.
+type Vacuum struct{}
+
 // Begin, Commit and Rollback control transactions.
 type (
 	Begin    struct{}
@@ -175,6 +178,7 @@ func (*Select) statement()      {}
 func (*Update) statement()      {}
 func (*Delete) statement()      {}
 func (*Explain) statement()     {}
+func (*Vacuum) statement()      {}
 func (*Begin) statement()       {}
 func (*Commit) statement()      {}
 func (*Rollback) statement()    {}
@@ -338,6 +342,7 @@ func (s *Delete) String() string {
 }
 
 func (s *Explain) String() string { return "EXPLAIN " + s.Query.String() }
+func (*Vacuum) String() string    { return "VACUUM" }
 func (*Begin) String() string     { return "BEGIN" }
 func (*Commit) String() string    { return "COMMIT" }
 func (*Rollback) String() string  { return "ROLLBACK" }

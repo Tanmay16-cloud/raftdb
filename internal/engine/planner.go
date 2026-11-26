@@ -15,12 +15,12 @@ type query struct {
 	columns []string
 }
 
-func (db *DB) selectRows(s *parser.Select) (*Result, error) {
-	q, err := db.planSelect(s)
+func (tx *txn) selectRows(s *parser.Select) (*Result, error) {
+	q, err := tx.planSelect(s)
 	if err != nil {
 		return nil, err
 	}
-	it, err := q.root.open(db)
+	it, err := q.root.open(tx)
 	if err != nil {
 		return nil, err
 	}
@@ -35,8 +35,8 @@ func (db *DB) selectRows(s *parser.Select) (*Result, error) {
 	return &Result{Columns: q.columns, Rows: rows, Message: fmt.Sprintf("SELECT %d", len(rows))}, nil
 }
 
-func (db *DB) explain(s *parser.Select) (*Result, error) {
-	q, err := db.planSelect(s)
+func (tx *txn) explain(s *parser.Select) (*Result, error) {
+	q, err := tx.planSelect(s)
 	if err != nil {
 		return nil, err
 	}
@@ -69,8 +69,8 @@ const maxJoinTables = 64
 //
 //	scans (with their own filters) -> joins -> remaining filters
 //	-> aggregate -> HAVING filter -> project -> distinct -> sort -> limit
-func (db *DB) planSelect(s *parser.Select) (*query, error) {
-	root, sc, err := db.planFrom(s)
+func (tx *txn) planSelect(s *parser.Select) (*query, error) {
+	root, sc, err := tx.planFrom(s)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +283,7 @@ func nonNegativeInt(e parser.Expr, clause string, def int64) (int64, error) {
 // table filters that table's scan, and may choose its access path ("predicate
 // pushdown"); a condition linking tables runs at the first join where all
 // of them are present. Tables are joined in the order written.
-func (db *DB) planFrom(s *parser.Select) (planNode, scope, error) {
+func (tx *txn) planFrom(s *parser.Select) (planNode, scope, error) {
 	if s.From == nil {
 		if s.Where == nil {
 			return valuesNode{}, nil, nil
@@ -306,7 +306,7 @@ func (db *DB) planFrom(s *parser.Select) (planNode, scope, error) {
 	var sources []*source
 	var full scope
 	for _, ref := range refs {
-		t, err := db.table(ref.Name)
+		t, err := tx.table(ref.Name)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -386,7 +386,7 @@ func (db *DB) planFrom(s *parser.Select) (planNode, scope, error) {
 				c.used = true
 			}
 		}
-		node, err := db.planTableScan(src.table, src.name, andAll(local), false)
+		node, err := tx.planTableScan(src.table, src.name, andAll(local), false)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -500,7 +500,7 @@ func planJoin(left, right planNode, conds []*cond, combined, leftScope, rightSco
 
 // planTableScan plans a scan of one table filtered by where (which may be
 // nil). withKey makes each row carry its primary key, for UPDATE and DELETE.
-func (db *DB) planTableScan(t *Table, name string, where parser.Expr, withKey bool) (planNode, error) {
+func (tx *txn) planTableScan(t *Table, name string, where parser.Expr, withKey bool) (planNode, error) {
 	sc := tableScope(t, name)
 	var root planNode = &scanNode{table: t, alias: name, path: chooseAccess(t, sc, conjuncts(where)), withKey: withKey}
 	if where == nil {

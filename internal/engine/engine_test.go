@@ -380,9 +380,9 @@ func TestDropTable(t *testing.T) {
 	// Dropping must remove the rows and index entries from storage, not just the catalog.
 	for _, prefix := range []string{"r", "x"} {
 		n := 0
-		it := db.scan([]byte(prefix), prefixEnd([]byte(prefix)))
+		it := readTxn(t, db).scan([]byte(prefix), prefixEnd([]byte(prefix)))
 		for {
-			_, _, ok, err := it.next()
+			_, _, ok, err := it.Next()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -463,15 +463,22 @@ func TestSchemaString(t *testing.T) {
 
 // checkIndexes verifies that every index holds exactly one entry per row,
 // keyed by the row's current value and pointing at the row's primary key.
+// It reads everything from one snapshot, and closes it so that it doesn't
+// hold back VACUUM.
 func checkIndexes(t *testing.T, db *DB) {
 	t.Helper()
-	for _, tbl := range db.Tables() {
+	tx, err := db.begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.rollback()
+	for _, tbl := range tx.tables {
 		want := map[string]bool{}
-		it := db.scan(rowPrefix(tbl.ID), prefixEnd(rowPrefix(tbl.ID)))
+		it := tx.scan(rowPrefix(tbl.ID), prefixEnd(rowPrefix(tbl.ID)))
 		var rows []Row
 		var pks [][]byte
 		for {
-			k, v, ok, err := it.next()
+			k, v, ok, err := it.Next()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -488,12 +495,12 @@ func checkIndexes(t *testing.T, db *DB) {
 		for _, idx := range tbl.Indexes {
 			clear(want)
 			for i, row := range rows {
-				want[string(indexKey(idx.ID, row[idx.Column], pks[i]))+"\x00"+string(pks[i])] = true
+				want[string(indexKey(idx, row[idx.Column], pks[i]))+"\x00"+string(pks[i])] = true
 			}
-			it := db.scan(indexPrefix(idx.ID), prefixEnd(indexPrefix(idx.ID)))
+			it := tx.scan(indexPrefix(idx.ID), prefixEnd(indexPrefix(idx.ID)))
 			n := 0
 			for {
-				k, v, ok, err := it.next()
+				k, v, ok, err := it.Next()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -535,4 +542,16 @@ func TestUpdateShiftsKeys(t *testing.T) {
 		t.Fatalf("unique collision with an untouched row: %v", err)
 	}
 	checkIndexes(t, db)
+}
+
+// readTxn returns a read-only transaction on the latest committed state,
+// for tests that inspect the stored keys directly.
+func readTxn(t *testing.T, db *DB) *txn {
+	t.Helper()
+	tx, err := db.begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tx.rollback() })
+	return tx
 }
