@@ -964,3 +964,7 @@ section.
 
 Most of what remains is the storage engine decoding a whole node on every
 visit. A cache of decoded nodes is the obvious next optimisation.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
