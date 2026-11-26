@@ -1,5 +1,8 @@
-// Command raftdb is an interactive SQL shell over a local database file.
-// It will become the database server once the Raft layer exists.
+// Command raftdb is raftdb's SQL shell and server.
+//
+//	raftdb [-db file]                          shell on a local, unreplicated database
+//	raftdb serve -id N -cluster 1=host:port,...  run node N of a cluster
+//	raftdb connect -cluster host:port,...        shell on a cluster
 package main
 
 import (
@@ -22,21 +25,38 @@ old row versions that no transaction can see any more.
   \d <table>     show a table's schema and indexes
   \parse <sql>   show how the parser reads a statement, without running it
   \timing        toggle printing how long each statement takes
-  \stats         show storage engine counters
+  \stats         show storage counters (local) or the node's Raft status (cluster)
   \?             show this message
   \q             quit`
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "serve":
+			serve(os.Args[2:])
+			return
+		case "connect":
+			connect(os.Args[2:])
+			return
+		}
+	}
 	path := flag.String("db", "raftdb.db", "path to the database file")
 	flag.Parse()
 
 	db, err := engine.Open(*path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "open:", err)
-		os.Exit(1)
+		fatal("open:", err)
 	}
 	defer db.Close()
+	runShell(localDB{db}, *path)
+}
 
+func fatal(args ...any) {
+	fmt.Fprintln(os.Stderr, args...)
+	os.Exit(1)
+}
+
+func runShell(db database, name string) {
 	// Prompts and the banner only make sense when a person is typing.
 	interactive := false
 	if fi, err := os.Stdin.Stat(); err == nil {
@@ -44,13 +64,33 @@ func main() {
 	}
 	s := &shell{db: db, out: os.Stdout, interactive: interactive}
 	if interactive {
-		fmt.Printf("raftdb (%s). Type \\? for help.\n", *path)
+		fmt.Printf("raftdb (%s). Type \\? for help.\n", name)
 	}
 	s.run(os.Stdin)
 }
 
+// database is what the shell runs against: a local database or a session
+// on a cluster.
+type database interface {
+	Exec(sql string) ([]*engine.Result, error)
+	InTransaction() bool
+	Tables() ([]*engine.Table, error)
+	Stats() (string, error)
+}
+
+type localDB struct{ db *engine.DB }
+
+func (l localDB) Exec(sql string) ([]*engine.Result, error) { return l.db.Exec(sql) }
+func (l localDB) InTransaction() bool                       { return l.db.InTransaction() }
+func (l localDB) Tables() ([]*engine.Table, error)          { return l.db.Tables(), nil }
+func (l localDB) Stats() (string, error) {
+	st := l.db.Stats()
+	return fmt.Sprintf("cache hits %d, misses %d, evictions %d, commits %d, rollbacks %d, checkpoints %d",
+		st.CacheHits, st.CacheMisses, st.Evictions, st.Commits, st.Rollbacks, st.Checkpoints), nil
+}
+
 type shell struct {
-	db          *engine.DB
+	db          database
 	out         io.Writer
 	interactive bool
 	timing      bool
@@ -123,8 +163,12 @@ func (s *shell) meta(line string) bool {
 	case `\?`, `\h`, `\help`:
 		fmt.Fprintln(s.out, help)
 	case `\d`:
+		tables, err := s.db.Tables()
+		if err != nil {
+			fmt.Fprintln(s.out, "ERROR:", err)
+			break
+		}
 		if arg == "" {
-			tables := s.db.Tables()
 			res := &engine.Result{Columns: []string{"table", "columns", "indexes"}}
 			for _, t := range tables {
 				res.Rows = append(res.Rows, engine.Row{t.Name, int64(len(t.Columns)), int64(len(t.Indexes))})
@@ -132,10 +176,16 @@ func (s *shell) meta(line string) bool {
 			printTable(s.out, res)
 			break
 		}
-		if t := s.db.Table(strings.ToLower(arg)); t != nil {
-			fmt.Fprintln(s.out, t)
-		} else if t := s.db.Table(arg); t != nil {
-			fmt.Fprintln(s.out, t)
+		var found *engine.Table
+		for _, name := range []string{strings.ToLower(arg), arg} {
+			for _, t := range tables {
+				if t.Name == name && found == nil {
+					found = t
+				}
+			}
+		}
+		if found != nil {
+			fmt.Fprintln(s.out, found)
 		} else {
 			fmt.Fprintf(s.out, "ERROR: table %q does not exist\n", arg)
 		}
@@ -152,9 +202,11 @@ func (s *shell) meta(line string) bool {
 		s.timing = !s.timing
 		fmt.Fprintf(s.out, "Timing is %s.\n", map[bool]string{true: "on", false: "off"}[s.timing])
 	case `\stats`:
-		st := s.db.Stats()
-		fmt.Fprintf(s.out, "cache hits %d, misses %d, evictions %d, commits %d, rollbacks %d, checkpoints %d\n",
-			st.CacheHits, st.CacheMisses, st.Evictions, st.Commits, st.Rollbacks, st.Checkpoints)
+		if st, err := s.db.Stats(); err != nil {
+			fmt.Fprintln(s.out, "ERROR:", err)
+		} else {
+			fmt.Fprintln(s.out, st)
+		}
 	default:
 		fmt.Fprintf(s.out, "unknown command %s; type \\? for help\n", cmd)
 	}

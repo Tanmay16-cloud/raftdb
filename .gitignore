@@ -2,3 +2,9 @@
 *.db-wal
 /bin/
 coverage.out
+
+# data directories created by "raftdb serve", and built binaries
+raftdb-node*/
+*.exe
+/raftdb
+/raftbench

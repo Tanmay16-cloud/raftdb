@@ -93,48 +93,57 @@ func TestReadYourOwnWrites(t *testing.T) {
 }
 
 // The classic lost update: two transactions read a balance and both write
-// back a new one. The second writer must fail instead of silently
-// overwriting the first.
+// back a new one. Writes are buffered until COMMIT, so both updates run;
+// the first to commit wins and the second must fail instead of silently
+// overwriting it.
 func TestLostUpdateIsPrevented(t *testing.T) {
 	db, a, b := accountsDB(t)
 	sessionExec(t, a, "BEGIN")
 	sessionExec(t, b, "BEGIN")
 	sessionExec(t, a, "UPDATE accounts SET balance = balance - 30 WHERE id = 1")
-	_, err := b.Query("UPDATE accounts SET balance = balance - 20 WHERE id = 1")
-	expectConflict(t, err, "second concurrent update of the same row")
-	if b.InTransaction() {
-		t.Fatal("conflict did not roll back the transaction")
-	}
+	sessionExec(t, b, "UPDATE accounts SET balance = balance - 20 WHERE id = 1")
 	sessionExec(t, a, "COMMIT")
+	_, err := b.Query("COMMIT")
+	expectConflict(t, err, "second commit of a concurrently updated row")
+	if b.InTransaction() {
+		t.Fatal("a failed COMMIT must end the transaction")
+	}
 	if got := runQuery(t, db, "SELECT balance FROM accounts WHERE id = 1"); got != "70" {
 		t.Fatalf("balance = %s", got)
 	}
 
-	// Updating a row that another transaction changed and committed after
+	// Deleting a row that another transaction changed and committed after
 	// this one began is a conflict too.
 	sessionExec(t, b, "BEGIN")
 	sessionExec(t, a, "UPDATE accounts SET balance = 0 WHERE id = 2")
-	_, err = b.Query("DELETE FROM accounts WHERE id = 2")
+	sessionExec(t, b, "DELETE FROM accounts WHERE id = 2")
+	_, err = b.Query("COMMIT")
 	expectConflict(t, err, "delete of a row updated after the snapshot")
 }
 
 func TestConcurrentInsertsOfTheSameKey(t *testing.T) {
-	_, a, b := accountsDB(t)
+	db, a, b := accountsDB(t)
 	sessionExec(t, a, "BEGIN; INSERT INTO accounts VALUES (3, 'meera', 1)")
-	sessionExec(t, b, "BEGIN")
-	_, err := b.Query("INSERT INTO accounts VALUES (3, 'kabir', 1)")
+	sessionExec(t, b, "BEGIN; INSERT INTO accounts VALUES (3, 'kabir', 1)")
+	sessionExec(t, a, "COMMIT")
+	_, err := b.Query("COMMIT")
 	expectConflict(t, err, "concurrent insert of the same primary key")
 
 	// Different primary keys but the same unique value: the unique index
 	// key carries no primary key, so the two inserts collide on it.
-	sessionExec(t, b, "BEGIN")
-	_, err = b.Query("INSERT INTO accounts VALUES (4, 'meera', 1)")
-	expectConflict(t, err, "concurrent insert of the same unique value")
+	sessionExec(t, a, "BEGIN; INSERT INTO accounts VALUES (4, 'zoya', 1)")
+	sessionExec(t, b, "BEGIN; INSERT INTO accounts VALUES (5, 'zoya', 1)")
 	sessionExec(t, a, "COMMIT")
+	_, err = b.Query("COMMIT")
+	expectConflict(t, err, "concurrent insert of the same unique value")
+	if got := runQuery(t, db, "SELECT id FROM accounts WHERE owner = 'zoya'"); got != "4" {
+		t.Fatalf("zoya: %q", got)
+	}
+	checkIndexes(t, db)
 
 	// Different keys and values don't conflict.
-	sessionExec(t, a, "BEGIN; INSERT INTO accounts VALUES (5, 'zoya', 1)")
-	sessionExec(t, b, "BEGIN; INSERT INTO accounts VALUES (6, 'dev', 1)")
+	sessionExec(t, a, "BEGIN; INSERT INTO accounts VALUES (6, 'ira', 1)")
+	sessionExec(t, b, "BEGIN; INSERT INTO accounts VALUES (7, 'dev', 1)")
 	sessionExec(t, a, "COMMIT")
 	sessionExec(t, b, "COMMIT")
 }

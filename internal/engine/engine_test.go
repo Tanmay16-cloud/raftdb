@@ -467,7 +467,7 @@ func TestSchemaString(t *testing.T) {
 // hold back VACUUM.
 func checkIndexes(t *testing.T, db *DB) {
 	t.Helper()
-	tx, err := db.begin(true)
+	tx, err := db.begin()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +548,7 @@ func TestUpdateShiftsKeys(t *testing.T) {
 // for tests that inspect the stored keys directly.
 func readTxn(t *testing.T, db *DB) *txn {
 	t.Helper()
-	tx, err := db.begin(true)
+	tx, err := db.begin()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,25 +4,29 @@ A distributed SQL database built from scratch in Go: a SQL front end, a
 B+ tree storage engine with a write-ahead log, MVCC transactions, and Raft
 replication across nodes.
 
-> Status: **Milestone 5 of 7 complete.** raftdb runs SQL on a single node:
-> tables, secondary indexes, joins and aggregates, planned by a rule-based
-> optimizer, with concurrent sessions isolated by MVCC (snapshot isolation),
-> on a crash-safe storage engine.
+> Status: **all 7 milestones complete.** raftdb runs SQL (tables, secondary
+> indexes, joins and aggregates, planned by a rule-based optimizer) with
+> concurrent sessions isolated by MVCC (snapshot isolation), on a crash-safe
+> storage engine, replicated across nodes by Raft, served over gRPC to a
+> client that finds the leader by itself. On a laptop, a three-node cluster
+> serves about 31,000 point reads/s or 3,000 inserts/s, and resumes writes
+> about 160 ms after its leader is killed.
 
-## Architecture (target)
+## Architecture
 
 ```
  client ──gRPC──▶ SQL layer        lexer → parser → planner → executor
                      │             rows and indexes encoded as key/value pairs
                      ▼
-                  Transactions     MVCC versions, snapshot isolation
-                     │
+                  Transactions     optimistic MVCC: read a snapshot, buffer writes,
+                     │             commit as one deterministic command
                      ▼
-                  Raft             leader election, log replication, snapshots
-                     │
+                  Raft             leader election (pre-vote, check quorum),
+                     │             log replication, linearizable ReadIndex reads
+                     │   ◀──gRPC──▶ other nodes
                      ▼
                   Storage engine   B+ tree · LRU buffer pool · write-ahead log
-                     │
+                     │             (one tree for the Raft log, one for the data)
                      ▼
                   data file + WAL file (4 KB pages)
 ```
@@ -43,24 +47,51 @@ replication across nodes.
       transactions. Verified by differential testing of index plans against
       full scans.
 - [x] **5. Transactions.** MVCC with snapshot isolation: concurrent
-      sessions, readers that never block, write-conflict detection,
-      crash recovery of unfinished transactions, and `VACUUM`. Verified
+      sessions, readers that never block, optimistic transactions that
+      commit as one deterministic command (ready for replication),
+      first-committer-wins conflict detection, and `VACUUM`. Verified
       against a reference model of snapshot isolation, with injected
       crashes.
-- [ ] **6. Replication.** Raft over gRPC, tested with injected partitions and
-      crashes.
-- [ ] **7. Server and benchmarks.** gRPC server, client, throughput and
-      failover-latency numbers.
+- [x] **6. Replication.** Raft over gRPC: elections with pre-vote and
+      check-quorum, log replication, linearizable reads, and a persistent
+      log. Verified by a deterministic cluster simulator with partitions,
+      message loss, reordering, clock drift and crashes, checked by
+      planting known Raft bugs; and end to end with SQL under chaos.
+- [x] **7. Server and benchmarks.** A gRPC SQL server and a client that
+      follows the leader and retries only when that is safe; group commit
+      and parallel leader/follower fsyncs; `raftdb serve` / `raftdb
+      connect`; and `raftbench`, measuring throughput, latency percentiles
+      and failover time on a real cluster.
 
 ## Usage
 
+Requires Go 1.26 or later (for gRPC).
+
 ```sh
 go test ./...                                    # run the test suite
+go test -short ./...                             # skip the slow chaos test
 go test ./internal/storage -run=XXX -bench=.     # storage benchmarks
 go test ./internal/engine -run=XXX -bench=.      # SQL benchmarks
-go run ./cmd/raftdb -db demo.db                  # SQL shell
+go test ./internal/cluster -run=XXX -bench=.     # replicated benchmarks
+go run ./cmd/raftdb -db demo.db                  # SQL shell (single node)
 go test ./internal/parser -fuzz=FuzzParse -fuzztime=60s   # fuzz the parser
+go run ./cmd/raftbench -workload insert -clients 16       # cluster benchmark
+go run ./cmd/raftbench -workload insert -failover         # kill the leader halfway
 ```
+
+A three-node cluster, one terminal per node, and a shell connected to it:
+
+```sh
+go build -o raftdb ./cmd/raftdb
+./raftdb serve -id 1 -cluster 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+./raftdb serve -id 2 -cluster 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+./raftdb serve -id 3 -cluster 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+./raftdb connect -cluster 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+```
+
+The shell works the same against a cluster; `\stats` shows the Raft state
+of the node it is connected to. Kill the leader's process and keep typing:
+the shell finds the new leader.
 
 The shell reads statements ending in `;`, which may span lines, and has a
 few backslash commands: `\d` lists tables, `\d <table>` shows a schema,
@@ -274,26 +305,9 @@ control**:
   began.
 
 So readers never block writers, writers never block readers, and a
-transaction sees one consistent state however long it runs. This is the
-approach of PostgreSQL and of CockroachDB-style key/value stores.
+transaction sees one consistent state however long it runs.
 
-### Versions and visibility
-
-Each read-write transaction takes a version number from a counter when it
-begins, and stamps every version it writes with it. It also records which
-transactions were still active at that moment. A version written by
-transaction `v` is visible to transaction `t` if:
-
-```
-v == t.version                                    t's own write, or
-v <  t.version and v was not active when t began  committed before t
-```
-
-A rolled-back transaction's versions are deleted, so no one ever sees them.
-Committing changes no data at all: the transaction just leaves the active
-set, so snapshots taken after that include it. Read-only transactions (all
-autocommit `SELECT`s) take a snapshot without consuming a version or writing
-anything.
+### Versions and snapshots
 
 Versions live in the tree under `v` + escaped key + 8-byte version. The key
 is escaped the same prefix-free, order-preserving way as text values, so all
@@ -301,23 +315,48 @@ versions of a key are adjacent, oldest first. The versions of every key in
 `[start, end)` then form one contiguous range, which a scan reads in order,
 keeping the newest visible version of each key.
 
-### Conflicts: first writer wins
+Each commit gets the next number from a version counter. A snapshot is just
+a version number: it sees exactly the versions below it, so it includes
+every commit made before it was taken and none made after.
 
-Before writing a key, a transaction looks at the key's newest version. If
-that version isn't visible to it, another transaction either committed the
-key after this one began or is still writing it. The write then fails with
-a serialization error, and the client retries. In practice:
+### Optimistic transactions: first committer wins
+
+A transaction (`mvcc.Tx`) reads from its snapshot and **buffers its writes
+in memory**. Its reads, scans included, see the snapshot overlaid with its
+own writes. Nothing reaches storage before `COMMIT`. At `COMMIT`, the
+transaction becomes a single, self-contained **command**: its snapshot
+version and the list of its writes. Applying the command checks every key it
+writes. If any has a version newer than the snapshot, another transaction
+committed that key after this one read, so the commit fails with a
+serialization error and the client retries:
 
 | Session A | Session B | |
 |---|---|---|
 | `BEGIN` | `BEGIN` | |
-| `UPDATE accounts SET balance = balance - 30 WHERE id = 1` | | |
-| | `UPDATE accounts SET balance = balance - 20 WHERE id = 1` | **error**: could not serialize access due to a concurrent update |
-| `COMMIT` | | balance is 70, not a lost update |
+| `UPDATE accounts SET balance = balance - 30 WHERE id = 1` | `UPDATE accounts SET balance = balance - 20 WHERE id = 1` | both run against their snapshots |
+| `COMMIT` | | |
+| | `COMMIT` | **error**: could not serialize access due to a concurrent update |
 
-The same mechanism enforces uniqueness across sessions. Two concurrent
-inserts of the same primary key, or of the same value in a unique index,
-write the same key, so the second one fails.
+The balance ends at 70, so no update is lost. The same check enforces
+uniqueness across sessions. Two concurrent inserts of the same primary key,
+or of the same value in a unique index, write the same key, so the second
+commit fails.
+
+**Why optimistic.** The first version of this milestone was pessimistic, in
+the style of PostgreSQL:
+- a transaction wrote versions into the tree as it went;
+- a write failed the moment it touched a key another open transaction had
+  written.
+
+That works on one machine. But a replicated database must make the same
+changes on every node in the same order, and that design needs every node to
+track every in-flight transaction. As commands, transactions are easy to
+replicate (Milestone 6): Raft orders the commands, and applying one is
+**deterministic**. The conflict check depends only on committed state and
+the command, so every replica makes the same decision. Applying a batch of
+buffered writes in one pass also turned out faster: bulk inserts went from
+111 µs to 82 µs per row, and point queries from 22 µs to 12 µs. The cost is
+that a doomed transaction finds out only at `COMMIT`.
 
 Snapshot isolation is **not serializable**: **write skew** is still possible.
 Two doctors are on call, and at least one must stay. Each transaction checks
@@ -331,98 +370,389 @@ which also tracks read-write dependencies, is future work.
 MVCC alone doesn't make schema changes safe. `CREATE INDEX` fills the index
 from its snapshot, so it would miss a row inserted by a concurrent
 transaction. Rows inserted concurrently with `DROP TABLE` would be left
-behind. Neither case collides on a key, so MVCC sees no conflict.
+behind. Neither case collides on a key, so no write conflict is detected.
 
-raftdb uses a coarse rule, checked at commit:
-- a transaction that changed the schema commits only if no other
-  transaction committed writes since it began;
-- a transaction that wrote data commits only if no schema change committed
-  since it began.
+raftdb uses a coarse rule, applied with every commit:
+- a commit that changes the schema fails if anything was committed since
+  its snapshot;
+- a commit that writes data fails if the schema changed since its snapshot.
 
 In effect, DDL takes a lock on the whole database. Each transaction reads
 the catalog through its own snapshot, so uncommitted schema changes are
-invisible to other sessions. The decoded catalog is cached per committed
-schema version, so statements don't decode it every time.
+invisible to other sessions. The decoded catalog is cached per schema
+version, so statements don't decode it every time.
 
 ### Durability and recovery
 
-A transaction touches storage only on its first write. Before its first
-version, it records the version counter, so a crash can't hand that number
-out again, and an **active marker**. Commit deletes the marker and fsyncs,
-and only then leaves the in-memory active set, so no one can see the writes
-before they are durable. Transactions that wrote nothing never fsync.
-
-Each transaction keeps the set of keys it wrote in memory, for `ROLLBACK`.
-But every commit flushes the whole tree, including other transactions'
-uncommitted versions. After a crash, opening the database therefore deletes
-every version whose transaction is still marked active. That costs one scan
-over all versions after a crash, in exchange for writing nothing but the
-versions themselves during normal operation. An earlier design wrote a
-per-key undo record instead, and the extra writes made bulk inserts about
-1.8x slower.
+Locally, each commit command is applied and then fsynced. The store's own
+bookkeeping is updated in the same storage commit as the data: the version
+counter, the last data and schema commits, and the vacuum floor. Since
+uncommitted writes never reach storage, there is nothing to undo after a
+crash. Read-only transactions write nothing at all. Sequences hand out table
+and row IDs. They are non-transactional, like PostgreSQL's, so concurrent
+inserts never conflict over them.
 
 ### Garbage collection: VACUUM
 
 Old versions accumulate, so `VACUUM` removes the ones no transaction can
-ever see again. The **horizon** is the oldest version that any open
-transaction might still need: the smallest of each open transaction's own
-version and the versions in its snapshot. For each key, only the newest
-version below the horizon matters to anyone. Older ones are deleted, and so
-is that newest one if it records a deletion. Vacuum doesn't run
-automatically yet. Until it does, tables that see many updates grow, and
-every read scans past the dead versions.
+ever see again. Its **horizon** is the oldest snapshot still open. For each
+key, only the newest version below the horizon matters to anyone. Older ones
+are deleted, and so is that newest one if it records a deletion. The horizon
+travels inside the vacuum command, so every replica removes the same
+versions. The store also remembers the highest horizon so far, and refuses
+commits from snapshots older than it ("snapshot too old"). Vacuum doesn't
+run automatically yet.
 
 ### Testing MVCC
 
-- **Model-based test** (`mvcc_test.go`). Random interleavings of
-  overlapping transactions, read-write and read-only, run against a reference model of snapshot
-  isolation that knows nothing about versions. In the model:
-  - each transaction reads the committed state as of its start, overlaid
-    with its own writes;
-  - a write conflicts exactly when another transaction wrote the same key
-    and is still open, or committed after this one began.
+- **Model-based tests** run random interleavings of overlapping
+  transactions against a reference model of snapshot isolation that knows
+  nothing about versions:
+  - `tx_test.go` tests optimistic transactions. Each transaction reads the
+    committed state as of its start, overlaid with its own writes, and its
+    commit fails exactly when a commit made after it started changed a key
+    it writes.
+  - `mvcc_test.go` tests the underlying versioned store, which applies each
+    command.
 
-  The store must agree on every read, scan, delete and conflict. The run
-  includes vacuums and two kinds of injected crash: a power cut that loses
-  everything since the last fsync, and a crash after the storage engine has
-  flushed every open transaction's versions. After each crash the store must
-  hold exactly the committed state. Each seed runs 3,000 operations with a
-  4-page buffer pool, and 100 seeds passed. The model test caught its own bug
-  first: the model built a commit's new state from the transaction's
-  snapshot instead of from the latest committed state.
-- **Anomaly tests** (`internal/engine/mvcc_test.go`). With two sessions, the
-  tests check:
+  The store must agree with the model on every read, scan, delete and
+  conflict. Each seed runs 3,000 operations with a 4-page buffer pool,
+  including vacuums and two kinds of injected crash. After a crash, the
+  store must hold exactly the committed state. 100 seeds passed for each
+  layer; a typical seed makes about 300 commits and 30 conflicts. The first
+  model test caught a bug in itself: the model built a commit's new state
+  from the transaction's snapshot instead of from the latest committed
+  state.
+- **Commands.** Applying a command twice at the same log index is a no-op.
+  Encoding round-trips, and every truncation of an encoded command is
+  rejected.
+- **Anomaly tests** (`internal/engine/mvcc_test.go`). With two sessions,
+  the tests check:
   - no dirty reads, non-repeatable reads, or phantoms, including through an
     index;
-  - lost updates and concurrent duplicate keys fail;
+  - lost updates and concurrent duplicate keys fail at `COMMIT`;
   - write skew does happen;
   - the schema-change rule holds in both orders;
-  - a transaction left open when the database closes is rolled back on
-    reopen;
   - `VACUUM` never breaks an open snapshot.
 - **Concurrent bank transfers.** Four goroutines, each with its own session,
   move money between accounts and retry on conflicts. Meanwhile, two readers
-  check that every snapshot sees the same total. A typical run commits 160
-  transfers and retries about 200 conflicts.
+  check that every snapshot sees the same total.
 - The engine's differential test also runs on top of MVCC, with `VACUUM`
-  every 50 steps. 30 seeds passed.
+  every 50 steps.
 
 The Go race detector needs a 64-bit C compiler, which the development
-machine lacks. I reviewed the shared state by hand: the store's counters and
-active set are guarded by its mutex, snapshots never change after `BEGIN`,
-and cached catalog maps are copied before a schema change modifies them.
-
-Statement coverage: about 86%.
+machine lacks. I reviewed the shared state by hand: commands and snapshots
+are serialized by the store's apply lock, a snapshot never changes, and
+cached catalog maps are copied before a schema change modifies them.
 
 ### Known limitations
 - Snapshot isolation, not serializable: write skew is possible.
-- A conflict fails immediately instead of waiting for the other transaction,
-  so clients must retry.
+- Conflicts are found only at `COMMIT`, so a doomed transaction runs to the
+  end. Clients must retry.
+- A transaction's writes are buffered in memory.
 - Schema changes conflict with every concurrent write, on any table.
 - `VACUUM` is manual and scans the whole database while holding the store's
   lock.
-- Commits are serialized, one fsync each; group commit would batch them.
-- After a crash, recovery scans every version.
+- Locally, commits are serialized, one fsync each; group commit would batch
+  them.
+
+## Replication: Raft (Milestone 6)
+
+A cluster keeps a full copy of the database on every node, and stays
+available as long as a majority of nodes are up and can talk to each other.
+The nodes agree on a single ordered log of commands using **Raft**: every
+node applies the same commands in the same order to its own MVCC store, so
+every replica ends up byte-for-byte identical.
+
+```
+ SQL session ── BEGIN: ReadIndex ──▶ leader ── snapshot of its local store
+             ── COMMIT: command ───▶ leader ── append to log ──▶ followers
+                                        ◀── a majority has persisted it ──┘
+                                     every node applies it to its store
+```
+
+### What gets replicated
+
+Raft replicates commands, so transactions must turn into commands. That is
+why Milestone 5's transactions became optimistic. A transaction reads a
+snapshot of the leader's store and buffers its writes; `COMMIT` proposes one
+command holding the snapshot version and the writes. Applying a command is
+**deterministic**. The first-committer-wins check, the schema rule and the
+version numbers all depend only on the store and the command, so every
+replica decides the same way. Other commands reserve sequence ranges for
+table and row IDs (100 at a time, so inserts rarely need an extra round) and
+run `VACUUM` with the leader's horizon.
+
+Determinism had to hold across crashes too, and a test found a case where it
+didn't. A commit whose deletes all missed consumed a version number without
+recording it. A replica that crashed and replayed its log would then number
+later commits differently from the others. Now the version counter is saved
+with every applied command. `TestReplicasConverge` replays a random command
+log into a second store that crashes at random points, and requires the two
+to end up identical. It fails without the fix.
+
+### The Raft core
+
+`internal/raft` is a deterministic state machine with no I/O, goroutines or
+clocks, in the style of etcd's raft library. The caller feeds it ticks,
+messages and proposals, and collects a `Ready`: state and entries to persist,
+messages to send, and committed entries to apply. It implements:
+
+- **Leader election** with randomized timeouts and the up-to-date-log vote
+  restriction.
+- **Log replication** with consistency checks and fast backtracking by term.
+  Pipelining is limited to a single chain per follower (see below).
+- **Commitment** only by counting replicas of an entry from the leader's
+  current term. A new leader commits a no-op to finish what earlier terms
+  left behind.
+- **Pre-vote** and **check-quorum** (thesis sections 9.6 and 6.2). A node
+  that can't hear the leader first asks whether it could win, without
+  raising its term. A leader that can't hear a majority steps down.
+- **Linearizable reads with ReadIndex** (thesis section 6.4). Before a
+  transaction takes its snapshot, the leader confirms with a quorum that it
+  still leads, and waits until it has applied everything committed before
+  the request. A deposed leader that hasn't noticed yet can't serve stale
+  data. Even without ReadIndex, its writes would be safe, because the
+  commit check runs against the real log. But its read-only queries would
+  return stale results.
+
+`internal/cluster` drives the core: a goroutine per node, the Raft log in a
+B+ tree of its own (entries larger than a page are split into chunks), and
+the node's MVCC store. A node persists entries and its term and vote, and
+fsyncs, before sending any message that depends on them (a leader's appends
+are the one exception; see Milestone 7). Applied commands
+are flushed every 256 entries; after a crash, the node replays its log from
+the last flush.
+
+Nodes talk over **gRPC**: a single method carries batches of Raft messages.
+There is no `.proto` file and no generated code. The service descriptor is
+written by hand and messages use a small binary codec, so the build needs no
+code generator. A sender goroutine per peer batches whatever has queued up.
+
+### Testing Raft
+
+**A deterministic simulator** (`raft_test.go`) runs 1-, 3- and 5-node
+clusters through 30,000 random steps of faults, then heals the network and
+requires the cluster to recover:
+- **Network faults:** messages are lost, duplicated and delivered in any
+  order. Nodes get partitioned, and some links fail in one direction only.
+- **Clock drift:** clocks run at different rates per node.
+- **Crashes:** a crashed node loses everything it hadn't persisted,
+  including work it had computed but not yet handled.
+
+After every step, the simulator checks Raft's safety properties:
+- **election safety:** at most one leader per term;
+- **log matching:** logs that agree at an index agree before it;
+- **leader completeness:** a new leader holds every committed entry;
+- **state machine safety:** no two nodes apply different entries at the
+  same index;
+- **linearizable reads:** a read's index covers everything committed when
+  the read began;
+- **monotonic hard state:** term and vote never go backwards.
+
+The run must also do real work. It fails if fewer than 50 entries commit, or
+fewer than 10 leaders are elected, while faults are on. A typical 3-node
+run elects about 25 leaders, survives about 45 crashes and commits 400–800
+entries under faults. 100 seeds per cluster size passed.
+
+**The simulator found real problems before any test failed outright.** Its
+first version reported success because its faults were miscalibrated: nodes
+were down so often that the cluster rarely had a quorum, so it was testing
+almost nothing. Once the guard against quiet runs was in place, two genuine
+liveness bugs showed up:
+- **Disruptive elections.** A node with a one-way network failure kept
+  starting elections and deposing healthy leaders. Pre-vote and
+  check-quorum fixed it.
+- **Replication flood.** Every heartbeat to a lagging follower started a new
+  append-acknowledge chain, and old chains never ended. The flood delayed
+  acknowledgements until the leader stepped down. Meanwhile, each new term
+  moved the commit target further away, so in one run 900 entries were
+  appended and only 4 committed. Now only the furthest append continues a
+  chain.
+
+**Checking the checker.** Six classic Raft bugs were planted, one at a time.
+Each must make the suite fail:
+
+| Planted bug | Caught by |
+|---|---|
+| votes ignore how up to date the candidate's log is | leader completeness |
+| a node votes twice in one term | election safety / monotonic hard state |
+| a leader commits an earlier term's entry by counting replicas | `TestFigure8`, a scripted replay of Figure 8 in the Raft paper |
+| a follower commits past the entries it just verified | state machine safety |
+| ReadIndex skips the quorum round | `TestStaleLeaderCannotConfirmReads`, a leader frozen as if by a long GC pause |
+| reads served before the new leader commits in its own term | linearizable reads |
+
+Two of these were missed at first, and each gap was fixed in the tests. The
+random simulator rarely produces Figure 8's precise sequence of crashes, so
+that case got a scripted test. Stale-leader reads need a leader whose clock
+stops, which a random walk rarely produces, so that case got one too.
+Running without check-quorum goes undetected, as it should, because
+check-quorum only affects liveness.
+
+**End to end** (`internal/cluster`). SQL runs on clusters over an in-memory
+network with fault injection:
+- **Basic replication:** after a mix of DDL, DML and transactions, every
+  replica is byte-for-byte identical. A follower refuses reads and names
+  the leader.
+- **Failover:** the leader crashes and the cluster elects a new one. No
+  committed row is lost. The old leader restarts from its log and catches
+  up.
+- **Partitioned leader:** an isolated leader can neither commit nor serve
+  reads. The majority carries on, and the old leader's uncommitted write is
+  discarded.
+- **Bank transfers under chaos:** four clients transfer money between
+  accounts while nodes crash and restart, links are cut and 20% of messages
+  are lost. Every replica must end with the same total and identical
+  contents. Typical runs commit about 300 transfers through 4 crashes.
+- **gRPC:** a three-node cluster runs over real gRPC connections on
+  localhost.
+
+### Known limitations
+- No log compaction or snapshots yet. The Raft log grows forever, and a new
+  or wiped node must replay it from the start.
+- Fixed membership: no adding or removing nodes.
+- Only the leader serves transactions. Followers redirect clients to it
+  (Milestone 7), so reads don't scale with cluster size.
+- A timed-out commit is ambiguous: it may or may not have been applied.
+- The gRPC transport is unauthenticated plaintext.
+
+## Server, client and benchmarks (Milestone 7)
+
+### Serving SQL
+
+Each node serves two gRPC services on one port: `raftdb.Raft` for traffic
+between nodes and `raftdb.SQL` for clients. As in Milestone 6, there is no
+`.proto` file. Messages encode themselves (`internal/wire`), and both
+services share one codec, since gRPC allows one per server.
+
+A SQL session is one bidirectional gRPC stream. The client sends
+statements, the server answers each with results, and an open transaction
+lives as long as the stream. The server runs the statements on the node's
+database. A response says what happened in terms a client can act on:
+
+| Code | Meaning | Safe to retry? |
+|---|---|---|
+| not leader | the node isn't the leader; the response names it | yes, nothing ran |
+| leader changed | a commit was lost to a leadership change | yes, it did not happen |
+| conflict | serialization failure; rolled back | the application decides |
+| unavailable | no quorum answered in time | **no**: a commit may have happened |
+
+### The client
+
+`internal/client` knows every node's address and remembers which one leads.
+It retries only when the server guarantees that nothing ran: no statement in
+the request completed, and no transaction was open, since an open
+transaction lived on the old leader and is gone. A request that may have
+committed is never sent twice. If the connection breaks mid-request, the
+client reports `ErrConnectionLost`, meaning the outcome is unknown, rather
+than guessing. In practice:
+- a client given a follower's address is redirected once and remembers the
+  leader;
+- when the leader dies, an in-flight write fails with an unknown outcome,
+  and the next one finds the new leader by itself;
+- a transaction open on the dead leader fails at its next statement.
+
+The tests (`internal/server`) cover:
+- leader routing from a follower's address;
+- every value type over the wire;
+- sessions and transactions that span requests;
+- conflicts between sessions;
+- rollback of a transaction whose session is dropped;
+- failover. The test kills the leader mid-workload and counts rows to check
+  that only ambiguous writes are uncertain, then checks the old leader
+  catches up after a restart.
+
+### Making replicated commits fast
+
+The first benchmark showed a three-node cluster doing 146 inserts/s with
+one client and 783/s with 16. Group commit was already in place: the node
+loop drains every queued proposal before a Raft round, so concurrent
+transactions share one append, one fsync and one round of messages. Yet
+latency doubled from one client to four. Two changes fixed most of it.
+
+**Leader and follower fsyncs in parallel** (Raft thesis section 10.2.1). The
+leader used to fsync an entry and only then send it, so each commit paid for
+two fsyncs in sequence. Now the leader sends appends first and writes to its
+own disk while the followers write to theirs. That is only safe if the
+leader stops counting its own copy towards a majority until it is actually
+on disk. So the core now waits for an explicit `Persisted(index, term)` from
+the caller. A crash between sending and persisting then can't produce a
+commit that a majority doesn't hold.
+
+The simulator was extended to model this:
+- leader writes are asynchronous and pipelined, with several Readys in
+  flight while the node keeps receiving messages and sending new ones;
+- nodes may crash with writes in flight.
+
+The planted-bug check confirmed the extension was needed. A leader that
+counts its own unpersisted entries passed the old simulator, because one
+Ready at a time can't expose the bug. The pipelined simulator catches it:
+"leader 2 of term 7 lacks committed entry 93". One defensive check stays
+untested: `Persisted` ignores a write whose entries were replaced in the
+meantime, which needs a node to lose and regain leadership with writes in
+flight.
+
+**Half the fsyncs were unnecessary.** Timing the node loop showed about two
+log saves per entry, and the leader spent 78% of its time in fsync. The
+second save happened because the commit index, which is part of Raft's hard
+state, had changed. It doesn't need to be durable: after a restart,
+committed entries are learned again and replayed. Now the commit index rides
+along with the next write of entries, term or vote.
+
+| Inserts/s (p50 latency) | 1 client | 16 clients |
+|---|---|---|
+| Milestone 6 node, with group commit | 146 (6.5 ms) | 783 (19.5 ms) |
+| + parallel fsyncs | 206 (4.7 ms) | 1,002 (15.0 ms) |
+| + no fsync for commit-index changes | **360 (2.6 ms)** | **1,316 (11.5 ms)** |
+
+A flaky test also turned up a shutdown race. A statement running while its
+node shut down read from closed storage, and the raw storage error reached
+the client. It is now reported as "unavailable". The chaos test passed 15
+runs in a row with the machine saturated by a benchmark.
+
+### Benchmarks
+
+`cmd/raftbench` starts a cluster of real nodes on localhost (gRPC, separate
+data files, one shared SSD), runs concurrent client sessions through the
+client library, and reports throughput and latency percentiles. Three
+nodes, 10 ms Raft ticks, on an i5-1235U laptop running Windows 11:
+
+| Workload | Clients | Throughput | p50 | p99 |
+|---|---|---|---|---|
+| point `SELECT` by primary key | 16 | 31,000 ops/s | 0.5 ms | 2.0 ms |
+| 90% point reads, 10% inserts | 16 | 3,700 ops/s | 3.9 ms | 12 ms |
+| `INSERT`, autocommit | 1 | 360 ops/s | 2.6 ms | 6.0 ms |
+| `INSERT`, autocommit | 16 | 1,300 ops/s | 11.5 ms | 24 ms |
+| `INSERT`, autocommit | 64 | 3,000 ops/s | 20 ms | 44 ms |
+| transfer: `BEGIN`, two `UPDATE`s, `COMMIT` | 16 | 1,000 txn/s | 14 ms | 33 ms |
+
+Throughput grows with concurrency because group commit puts more
+transactions behind each fsync. In the transfer workload, about 2% of
+transactions hit a serialization conflict and were rolled back. The total
+balance was exact at the end.
+
+**Failover.** With `-failover`, raftbench kills the leader halfway through
+an insert workload with 16 clients. It reports two numbers: how long the
+cluster takes to elect a new leader, and when the first write begun after
+the kill succeeds. Writes in flight at the kill fail with an unknown
+outcome, one per client.
+
+| Raft tick (election timeout 10–20 ticks) | New leader after | First new write succeeds after |
+|---|---|---|
+| 10 ms | 118–169 ms | about 160 ms (one run of five: 324 ms) |
+| 5 ms | 78–86 ms | 88–158 ms |
+
+Shorter ticks speed up failover at the cost of more heartbeat traffic, and
+a higher risk of needless elections on a slow network.
+
+### Known limitations
+- Each transaction needs a ReadIndex round for its snapshot before it can
+  commit. Lease reads would save it, but they rely on bounded clock drift,
+  which the simulator showed is not safe to assume.
+- The data store flushes on the node loop every 256 entries, which shows up
+  in tail latency.
+- No TLS or authentication.
+- The client doesn't retry conflicts; applications must.
 
 ## SQL parser (Milestone 3)
 
@@ -616,11 +946,21 @@ many commits into one fsync.
 an integer primary key, a secondary index and a text column, compared with
 Milestone 4, which had no MVCC:
 
-| Operation | Milestone 4 | With MVCC | Notes |
-|---|---|---|---|
-| `INSERT`, one transaction each | ~1.3–1.9 ms | ~1.3–1.6 ms | fsync-bound either way |
-| `INSERT`, 1,000 per transaction | ~86 µs | ~111 µs | each write first reads the key's versions to check for conflicts |
-| point `SELECT` by primary key | ~26 µs | ~22 µs | read-only snapshots write nothing; the catalog is cached |
+| Operation | Milestone 4 | Pessimistic MVCC | Optimistic MVCC | Notes |
+|---|---|---|---|---|
+| `INSERT`, one transaction each | ~1.3–1.9 ms | ~1.3–1.6 ms | ~1.4 ms | fsync-bound |
+| `INSERT`, 1,000 per transaction | ~86 µs | ~111 µs | ~82 µs | writes are buffered and applied in one pass at commit |
+| point `SELECT` by primary key | ~26 µs | ~22 µs | ~12 µs | read-only snapshots write nothing; the catalog is cached |
+
+**Replicated** (`go test ./internal/cluster -run=XXX -bench=.`). Three nodes
+in one process, on the same disk:
+
+| Operation | Time per op | Notes |
+|---|---|---|
+| `INSERT`, one transaction each | ~5.5 ms → ~2.5 ms | a ReadIndex round, then a log fsync on the leader and a follower; Milestone 7 overlapped the two and dropped a redundant one |
+
+Throughput and failover over a real gRPC cluster are in the Milestone 7
+section.
 
 Most of what remains is the storage engine decoding a whole node on every
 visit. A cache of decoded nodes is the obvious next optimisation.

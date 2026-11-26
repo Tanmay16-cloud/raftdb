@@ -203,13 +203,13 @@ func TestDoneTransactions(t *testing.T) {
 func TestSequencesAreNotTransactional(t *testing.T) {
 	s := newStore(t)
 	for want := uint64(1); want <= 3; want++ {
-		n, err := s.Sequence([]byte("ids"))
+		n, err := s.Sequence([]byte("ids"), 1)
 		must(t, err)
 		if n != want {
 			t.Fatalf("sequence = %d, want %d", n, want)
 		}
 	}
-	n, err := s.Sequence([]byte("other"))
+	n, err := s.Sequence([]byte("other"), 1)
 	must(t, err)
 	if n != 1 {
 		t.Fatalf("second sequence = %d", n)

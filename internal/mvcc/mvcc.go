@@ -91,6 +91,11 @@ type Store struct {
 	persisted uint64            // the version counter as last written to storage
 	active    map[uint64]bool   // read-write transactions in progress
 	open      map[*Txn]struct{} // every transaction in progress, for Vacuum
+
+	// applyMu serializes commands (see command.go) and the snapshots taken
+	// between them. meta is the command layer's persistent state.
+	applyMu sync.Mutex
+	meta    storeMeta
 }
 
 // Open wraps tree. It rolls back any transaction that a crash left active.
@@ -105,6 +110,9 @@ func Open(tree *storage.BTree) (*Store, error) {
 	}
 	s.persisted = s.next
 	if err := s.recover(); err != nil {
+		return nil, err
+	}
+	if err := s.loadMeta(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -188,24 +196,24 @@ func (s *Store) snapshot() map[uint64]bool {
 	return m
 }
 
-// Sequence increments the counter called name and returns its new value,
-// starting at 1. Sequences are not transactional: a rolled-back
-// transaction does not give its numbers back, so concurrent transactions
-// never conflict over them (like sequences in PostgreSQL).
-func (s *Store) Sequence(name []byte) (uint64, error) {
+// Sequence reserves the next n values of the counter called name and
+// returns the first; counters start at 1. Sequences are not transactional:
+// a rolled-back transaction does not give its numbers back, so concurrent
+// transactions never conflict over them (like sequences in PostgreSQL).
+// The change is durable at the next commit or Flush.
+func (s *Store) Sequence(name []byte, n uint64) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := append([]byte("s"), name...)
-	n := uint64(0)
+	last := uint64(0)
 	v, ok, err := s.tree.Get(key)
 	if err != nil {
 		return 0, err
 	}
 	if ok {
-		n = binary.BigEndian.Uint64(v)
+		last = binary.BigEndian.Uint64(v)
 	}
-	n++
-	return n, s.tree.Put(key, binary.BigEndian.AppendUint64(nil, n))
+	return last + 1, s.tree.Put(key, binary.BigEndian.AppendUint64(nil, last+n))
 }
 
 // CheckKey reports whether key is small enough to store.
@@ -329,7 +337,11 @@ func (t *Txn) write(key, raw []byte) error {
 
 // Commit makes the transaction's writes durable and visible to
 // transactions that begin afterwards.
-func (t *Txn) Commit() error {
+func (t *Txn) Commit() error { return t.commit(true) }
+
+// commit is Commit, optionally without the fsync, for callers that make
+// the commit durable some other way (the command layer's Raft log).
+func (t *Txn) commit(sync bool) error {
 	if t.done {
 		return ErrDone
 	}
@@ -347,8 +359,10 @@ func (t *Txn) Commit() error {
 		}
 		// The commit point. Syncing before leaving the active set means no
 		// other transaction can see these writes until they are durable.
-		if err := s.tree.Sync(); err != nil {
-			return err
+		if sync {
+			if err := s.tree.Sync(); err != nil {
+				return err
+			}
 		}
 	}
 	delete(s.active, t.version)
@@ -391,6 +405,12 @@ func (t *Txn) Rollback() error {
 // one. So for each key, only the newest version below the horizon matters;
 // older ones are removed, and so is that newest one if it is a deletion.
 func (s *Store) Vacuum() (int, error) {
+	return s.vacuumBelow(s.Horizon(), true)
+}
+
+// Horizon returns the oldest version that an open transaction may still
+// need: no version below it is invisible to any of them.
+func (s *Store) Horizon() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	horizon := s.next
@@ -400,6 +420,13 @@ func (s *Store) Vacuum() (int, error) {
 			horizon = min(horizon, v)
 		}
 	}
+	return horizon
+}
+
+// vacuumBelow is Vacuum with a given horizon.
+func (s *Store) vacuumBelow(horizon uint64, sync bool) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	var doomed [][]byte
 	var group []kvPair // versions below the horizon of the current key
@@ -440,7 +467,7 @@ func (s *Store) Vacuum() (int, error) {
 			return 0, err
 		}
 	}
-	if len(doomed) > 0 {
+	if len(doomed) > 0 && sync {
 		if err := s.tree.Sync(); err != nil {
 			return 0, err
 		}

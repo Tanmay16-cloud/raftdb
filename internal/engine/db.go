@@ -16,23 +16,34 @@ import (
 // concurrent one. The transaction has been rolled back and can be retried.
 var ErrConflict = mvcc.ErrConflict
 
+// Backend is where a database's data lives and how its transactions
+// commit. A local database uses its mvcc.Store directly; a replicated one
+// reads from the local replica and commits through Raft.
+type Backend interface {
+	// Snapshot starts a read-only snapshot for a transaction, and returns
+	// the version of the last schema change it sees.
+	Snapshot() (*mvcc.Txn, uint64, error)
+	// Execute runs a command (a commit, a sequence reservation, a vacuum).
+	Execute(*mvcc.Command) (mvcc.Result, error)
+	// Horizon returns the oldest version an open snapshot may still need.
+	Horizon() uint64
+}
+
 // DB is a SQL database. It is safe for concurrent use: each Session runs
 // its own transactions, isolated from the others by MVCC.
 type DB struct {
-	tree  *storage.BTree
-	store *mvcc.Store
+	tree    *storage.BTree // nil unless the DB owns its storage
+	backend Backend
 
-	// mu orders transaction starts and commits for the schema change rule
-	// (see txn.commit). commitSeq counts commits that wrote something, and
-	// schemaSeq is the commitSeq of the last one that changed the schema.
-	mu                   sync.Mutex
-	commitSeq, schemaSeq uint64
-
-	// The catalog as of schemaSeq catalogSeq, shared read-only by
+	mu sync.Mutex
+	// The catalog as of schema version catalogSeq, shared read-only by
 	// transactions (see begin).
 	catalog      map[string]*Table
 	catalogSeq   uint64
 	catalogValid bool
+	// Sequence values reserved but not yet handed out, by sequence name.
+	reserved map[string][2]uint64 // next, end
+	seqBlock uint64               // how many values to reserve at a time
 
 	// The session behind DB.Exec and friends.
 	defMu sync.Mutex
@@ -47,14 +58,13 @@ type Session struct {
 	tx *txn // the open BEGIN ... COMMIT transaction, if any
 }
 
-// txn is the state of one transaction: its MVCC transaction and the
-// catalog as its snapshot sees it.
+// txn is the state of one transaction: its optimistic MVCC transaction and
+// the catalog as its snapshot sees it.
 type txn struct {
-	db       *DB
-	kv       *mvcc.Txn
-	tables   map[string]*Table
-	startSeq uint64
-	ddl      bool // changed the schema
+	db     *DB
+	kv     *mvcc.Tx
+	tables map[string]*Table
+	ddl    bool // changed the schema
 }
 
 // Result is the outcome of one statement.
@@ -80,9 +90,18 @@ func OpenWithOptions(path string, opts storage.Options) (*DB, error) {
 		tree.Close()
 		return nil, err
 	}
-	db := &DB{tree: tree, store: store}
-	db.def = db.Session()
+	db := New(store, 1)
+	db.tree = tree
 	return db, nil
+}
+
+// New returns a database over backend. Sequence values (table and row IDs)
+// are reserved seqBlock at a time, which matters when each reservation is
+// a round of consensus.
+func New(backend Backend, seqBlock uint64) *DB {
+	db := &DB{backend: backend, seqBlock: max(seqBlock, 1), reserved: map[string][2]uint64{}}
+	db.def = db.Session()
+	return db
 }
 
 // Session starts a new session.
@@ -94,11 +113,39 @@ func (db *DB) Close() error {
 	db.defMu.Lock()
 	db.def.Close()
 	db.defMu.Unlock()
-	return db.tree.Close()
+	if db.tree != nil {
+		return db.tree.Close()
+	}
+	return nil
 }
 
 // Stats returns the storage engine's activity counters.
-func (db *DB) Stats() storage.Stats { return db.tree.Stats() }
+func (db *DB) Stats() storage.Stats {
+	if db.tree == nil {
+		return storage.Stats{}
+	}
+	return db.tree.Stats()
+}
+
+// sequence returns the next value of a sequence, reserving a block of
+// values from the backend when the last block runs out.
+func (db *DB) sequence(name []byte) (uint64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	r := db.reserved[string(name)]
+	if r[0] == r[1] {
+		res, err := db.backend.Execute(&mvcc.Command{Op: mvcc.OpSequence, Name: name, N: db.seqBlock})
+		if err == nil {
+			err = res.Err
+		}
+		if err != nil {
+			return 0, err
+		}
+		r = [2]uint64{res.First, res.First + db.seqBlock}
+	}
+	db.reserved[string(name)] = [2]uint64{r[0] + 1, r[1]}
+	return r[0], nil
+}
 
 // Exec, Query, ExecStatement, InTransaction, Tables and Table use the
 // database's default session.
@@ -191,7 +238,7 @@ func (s *Session) ExecStatement(st parser.Statement) (*Result, error) {
 		if s.tx != nil {
 			return nil, errors.New("a transaction is already in progress")
 		}
-		tx, err := s.db.begin(false)
+		tx, err := s.db.begin()
 		if err != nil {
 			return nil, err
 		}
@@ -219,11 +266,16 @@ func (s *Session) ExecStatement(st parser.Statement) (*Result, error) {
 		if s.tx != nil {
 			return nil, errors.New("VACUUM cannot run inside a transaction")
 		}
-		n, err := s.db.store.Vacuum()
+		// The horizon comes from the snapshots open here; replicas apply
+		// the same horizon, and refuse commits from older snapshots.
+		res, err := s.db.backend.Execute(&mvcc.Command{Op: mvcc.OpVacuum, Horizon: s.db.backend.Horizon()})
+		if err == nil {
+			err = res.Err
+		}
 		if err != nil {
 			return nil, err
 		}
-		return &Result{Message: fmt.Sprintf("VACUUM %d", n)}, nil
+		return &Result{Message: fmt.Sprintf("VACUUM %d", res.Removed)}, nil
 	}
 
 	if s.tx != nil {
@@ -234,9 +286,7 @@ func (s *Session) ExecStatement(st parser.Statement) (*Result, error) {
 		}
 		return res, nil
 	}
-	_, query := st.(*parser.Select)
-	_, explain := st.(*parser.Explain)
-	tx, err := s.db.begin(query || explain)
+	tx, err := s.db.begin()
 	if err != nil {
 		return nil, err
 	}
@@ -254,23 +304,46 @@ func (s *Session) ExecStatement(st parser.Statement) (*Result, error) {
 // Tables returns the definitions of every table, as the session's
 // transaction (or, outside one, the latest committed state) sees them.
 func (s *Session) Tables() []*Table {
-	tables := s.catalog()
+	tables, _ := s.ListTables()
+	return tables
+}
+
+// ListTables returns the tables the session can see, sorted by name, or
+// the error that kept it from reading the catalog (on a replicated
+// database, for example, because the node isn't the leader).
+func (s *Session) ListTables() ([]*Table, error) {
+	tables := s.tables()
+	if tables == nil && s.tx == nil {
+		tx, err := s.db.begin()
+		if err != nil {
+			return nil, err
+		}
+		defer tx.rollback()
+		tables = tx.tables
+	}
 	out := make([]*Table, 0, len(tables))
 	for _, t := range tables {
 		out = append(out, t)
 	}
 	slices.SortFunc(out, func(a, b *Table) int { return strings.Compare(a.Name, b.Name) })
-	return out
+	return out, nil
 }
 
-// Table returns the definition of one table, or nil.
+// tables returns the open transaction's catalog, or nil.
+func (s *Session) tables() map[string]*Table {
+	if s.tx != nil {
+		return s.tx.tables
+	}
+	return nil
+}
+
 func (s *Session) Table(name string) *Table { return s.catalog()[name] }
 
 func (s *Session) catalog() map[string]*Table {
 	if s.tx != nil {
 		return s.tx.tables
 	}
-	tx, err := s.db.begin(true)
+	tx, err := s.db.begin()
 	if err != nil {
 		return nil
 	}
@@ -281,29 +354,26 @@ func (s *Session) catalog() map[string]*Table {
 // ---------------------------------------------------------------------------
 // Transactions
 
-// begin starts a transaction.
+// begin starts a transaction. A read-only transaction is the same as any
+// other here: with optimistic concurrency, a transaction that writes
+// nothing commits without doing anything.
 //
 // Decoding the catalog for every statement would be slow, so the database
-// caches it. A transaction sees every schema change committed before it
-// began and none after, which is exactly the cached catalog if no schema
-// change has committed since the cache was loaded. Transactions share the
-// cached map until one changes the schema (see ownCatalog).
-func (db *DB) begin(readOnly bool) (*txn, error) {
-	db.mu.Lock()
-	tx := &txn{db: db, startSeq: db.commitSeq}
-	var err error
-	if readOnly {
-		tx.kv = db.store.BeginReadOnly()
-	} else {
-		tx.kv, err = db.store.Begin()
-	}
-	schemaSeq := db.schemaSeq
-	cached := db.catalogValid && db.catalogSeq == schemaSeq
-	tx.tables = db.catalog
-	db.mu.Unlock()
+// caches it. A snapshot sees every schema change committed before it and
+// none after, so the catalog it sees depends only on the version of the
+// last schema change it can see: if that matches the cached catalog's, the
+// cache is right. Transactions share the cached map until one changes the
+// schema (see ownCatalog).
+func (db *DB) begin() (*txn, error) {
+	snap, schemaVersion, err := db.backend.Snapshot()
 	if err != nil {
 		return nil, err
 	}
+	tx := &txn{db: db, kv: mvcc.NewTx(snap, db.backend)}
+	db.mu.Lock()
+	cached := db.catalogValid && db.catalogSeq == schemaVersion
+	tx.tables = db.catalog
+	db.mu.Unlock()
 	if cached {
 		return tx, nil
 	}
@@ -312,50 +382,15 @@ func (db *DB) begin(readOnly bool) (*txn, error) {
 		return nil, err
 	}
 	db.mu.Lock()
-	if db.schemaSeq == schemaSeq {
-		db.catalog, db.catalogSeq, db.catalogValid = tx.tables, schemaSeq, true
-	}
+	db.catalog, db.catalogSeq, db.catalogValid = tx.tables, schemaVersion, true
 	db.mu.Unlock()
 	return tx, nil
 }
 
-// commit commits the transaction, or rolls it back if it would break the
-// schema change rule.
-//
-// Snapshot isolation alone doesn't protect schema changes. CREATE INDEX
-// fills the index from its snapshot, so a row that a concurrent
-// transaction inserts would be missing from it; and rows inserted
-// concurrently with DROP TABLE would be left behind. Neither collides on a
-// key, so MVCC sees no conflict. The rule is coarse but safe: a transaction
-// that changed the schema commits only if no other transaction has
-// committed writes since it began, and a transaction that wrote data
-// commits only if no schema change has committed since it began. In effect
-// schema changes take a lock on the whole database, checked at commit.
-func (tx *txn) commit() error {
-	db := tx.db
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if tx.kv.Wrote() {
-		switch {
-		case tx.ddl && db.commitSeq != tx.startSeq:
-			tx.kv.Rollback()
-			return fmt.Errorf("%w: other transactions wrote data while this one changed the schema", ErrConflict)
-		case !tx.ddl && db.schemaSeq > tx.startSeq:
-			tx.kv.Rollback()
-			return fmt.Errorf("%w: another transaction changed the schema", ErrConflict)
-		}
-	}
-	if err := tx.kv.Commit(); err != nil {
-		return err
-	}
-	if tx.kv.Wrote() {
-		db.commitSeq++
-		if tx.ddl {
-			db.schemaSeq = db.commitSeq
-		}
-	}
-	return nil
-}
+// commit commits the transaction. Conflicts with concurrent transactions,
+// including the rule that serializes schema changes against writes, are
+// decided when the commit is applied (see mvcc.Store.Apply).
+func (tx *txn) commit() error { return tx.kv.Commit() }
 
 func (tx *txn) rollback() error { return tx.kv.Rollback() }
 
@@ -386,7 +421,7 @@ func (tx *txn) run(s parser.Statement) (*Result, error) {
 // ---------------------------------------------------------------------------
 // Storage access
 
-func (tx *txn) scan(start, end []byte) *mvcc.Iterator { return tx.kv.Scan(start, end) }
+func (tx *txn) scan(start, end []byte) *mvcc.TxIterator { return tx.kv.Scan(start, end) }
 
 // deleteRange removes every key in [start, end). Deleted keys vanish from
 // the transaction's own view, so each pass rescans from the start.
@@ -592,7 +627,7 @@ func (tx *txn) primaryKey(t *Table, row Row) ([]byte, error) {
 	if t.PK >= 0 {
 		return appendKey(nil, row[t.PK]), nil
 	}
-	id, err := tx.db.store.Sequence(rowIDKey(t.ID))
+	id, err := tx.db.sequence(rowIDKey(t.ID))
 	if err != nil {
 		return nil, err
 	}

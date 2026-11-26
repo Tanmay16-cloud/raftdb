@@ -44,7 +44,7 @@ func TestShellSession(t *testing.T) {
 	}
 	defer db.Close()
 	var out strings.Builder
-	sh := &shell{db: db, out: &out}
+	sh := &shell{db: localDB{db}, out: &out}
 	sh.run(strings.NewReader(strings.Join([]string{
 		"\xef\xbb\xbfCREATE TABLE users (id INT PRIMARY KEY, name TEXT,",
 		"  score FLOAT);",

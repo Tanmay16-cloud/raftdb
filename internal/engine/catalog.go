@@ -99,7 +99,7 @@ func (tx *txn) saveTable(t *Table) error {
 // nextID allocates an ID for a new table or index. IDs come from a
 // sequence, so they are never reused, even by rolled-back transactions.
 func (tx *txn) nextID() (uint32, error) {
-	n, err := tx.db.store.Sequence(nextIDKey)
+	n, err := tx.db.sequence(nextIDKey)
 	if n > math.MaxUint32 {
 		return 0, errors.New("engine: out of table and index IDs")
 	}
@@ -133,5 +133,6 @@ func (tx *txn) ownCatalog() {
 	if !tx.ddl {
 		tx.tables = maps.Clone(tx.tables)
 		tx.ddl = true
+		tx.kv.MarkSchema()
 	}
 }
