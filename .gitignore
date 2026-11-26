@@ -1,0 +1,4 @@
+*.db
+*.db-wal
+/bin/
+coverage.out
